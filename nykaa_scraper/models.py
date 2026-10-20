@@ -38,7 +38,10 @@ class ProductInfo:
     currency: str = "INR"
     availability: str = ""
     total_reviews_count: int = 0
+    total_ratings_count: int = 0
     average_rating: Optional[float] = None
+    parent_id: Optional[str] = None
+    variant_ids: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

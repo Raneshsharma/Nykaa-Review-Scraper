@@ -1,10 +1,14 @@
 """
 A local stand-in for Nykaa's reviews API, used by the tests.
 
-It mimics what the scraper relies on: page-numbered JSON pages, a page ceiling
-(400 beyond it), per-filter review counts, four sort orders, and optional
-behaviours (bigger page sizes, combined filters, rate limiting, flaky errors,
-Akamai-style HTML challenges, malformed fields).
+It reproduces the behaviour observed on the live site:
+  * 20 reviews per page, HTTP 400 beyond page 40 (the "page ceiling")
+  * filters=STAR_1..STAR_5 (VERIFIED_BUYER is always on), childIds=<variant>, both combinable
+  * reviewCount counts hidden reviews too, but hidden reviews are never served
+    (pages come back shorter instead)
+  * within one star rating, POSITIVE_FIRST / NEGATIVE_FIRST give the MOST_USEFUL order
+  * unknown filters -> HTTP 400
+Optional misbehaviour: rate limiting (429), server errors (500), Akamai-style HTML challenges.
 """
 
 import json
@@ -12,6 +16,8 @@ import random
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+
+KNOWN_FILTERS = {"STAR_1", "STAR_2", "STAR_3", "STAR_4", "STAR_5", "VERIFIED_BUYER", "WITH_IMAGES"}
 
 
 class MockNykaa:
@@ -21,8 +27,8 @@ class MockNykaa:
         page_size=20,
         ceiling=40,
         star_weights=(0.62, 0.18, 0.09, 0.04, 0.07),  # 5..1 stars
-        page_size_param=None,      # e.g. "pageSize": API honours this param (max 100)
-        combined_filters=False,    # API understands "STAR_5,VERIFIED_BUYER"
+        variants=("1001",),        # childIds reviews are spread over
+        hidden_fraction=0.0,       # share of reviews that are counted but never served
         fail_every=0,              # every Nth reviews request -> HTTP 500
         rate_limit_every=0,        # every Nth reviews request -> HTTP 429
         challenge_every=0,         # every Nth reviews request -> HTML page with status 200
@@ -31,8 +37,6 @@ class MockNykaa:
         rnd = random.Random(seed)
         self.page_size = page_size
         self.ceiling = ceiling
-        self.page_size_param = page_size_param
-        self.combined_filters = combined_filters
         self.fail_every = fail_every
         self.rate_limit_every = rate_limit_every
         self.challenge_every = challenge_every
@@ -41,6 +45,7 @@ class MockNykaa:
         self.reviews = []
         for i in range(n_reviews):
             rating = rnd.choices([5, 4, 3, 2, 1], star_weights)[0]
+            hidden = rnd.random() < hidden_fraction
             self.reviews.append({
                 "id": 100000 + i,
                 # Malformed / odd fields the real API has been seen to send
@@ -48,29 +53,34 @@ class MockNykaa:
                 "title": f"Title {i}",
                 "description": f"Line one<br/>line two &amp; more {i}\x0b",
                 "name": None if i % 11 == 0 else f"User {i}",
-                "createdOn": f"2024-01-{(i % 28) + 1:02d}",
+                "createdOn": f"2024-01-{(i % 28) + 1:02d} 10:00:{i % 60:02d}",
+                "childId": int(rnd.choice(variants)),
+                "likeCount": None if i % 5 == 0 else (0 if hidden else rnd.randint(0, 50)),
+                "isBuyer": True,
                 "_ts": i,
-                "likeCount": None if i % 5 == 0 else rnd.randint(0, 50),
-                "isBuyer": rnd.random() < 0.7,
+                "_helpful": rnd.random(),
+                "_hidden": hidden,
             })
 
     @property
     def ids(self):
-        return {str(r["id"]) for r in self.reviews}
+        """IDs of every review the API will actually serve."""
+        return {str(r["id"]) for r in self.reviews if not r["_hidden"]}
+
+    def rating_of(self, r):
+        return int(float(r["rating"]))
 
     # -- request handling -------------------------------------------------
-    def _filtered(self, filters):
+    def _filtered(self, filters, child_ids):
         items = self.reviews
-        parts = filters.split(",") if filters else []
-        if len(parts) > 1 and not self.combined_filters:
-            parts = parts[:1]  # unsupported combos: API only applies the first filter
-        for f in parts:
-            if f in ("STAR_1", "STAR_2", "STAR_3", "STAR_4", "STAR_5"):
-                items = [x for x in items if int(float(x["rating"])) == int(f[-1])]
-            elif f == "VERIFIED_BUYER":
-                items = [x for x in items if x["isBuyer"]]
-            else:
+        for f in [x for x in (filters or "").split(",") if x]:
+            if f not in KNOWN_FILTERS:
                 raise ValueError(f"unknown filter {f}")
+            if f.startswith("STAR_"):
+                items = [x for x in items if self.rating_of(x) == int(f[-1])]
+        if child_ids:
+            wanted = {int(c) for c in child_ids.split(",")}
+            items = [x for x in items if x["childId"] in wanted]
         return items
 
     def handle(self, path, query):
@@ -86,30 +96,30 @@ class MockNykaa:
         if self.challenge_every and n % self.challenge_every == 0:
             return 200, "text/html", "<html>Access Denied</html>"
 
+        if "size" in query:
+            return 400, "application/json", json.dumps({"error": "bad param"})
         page = int(query.get("pageNo", "1"))
         if page > self.ceiling:
             return 400, "application/json", json.dumps({"error": "invalid page"})
-
-        size = self.page_size
-        if self.page_size_param and self.page_size_param in query:
-            size = max(1, min(int(query[self.page_size_param]), 100))
-
         try:
-            items = self._filtered(query.get("filters"))
+            items = self._filtered(query.get("filters"), query.get("childIds"))
         except ValueError as e:
             return 400, "application/json", json.dumps({"error": str(e)})
-        sort = query.get("sort", "MOST_RECENT")
+
+        useful = lambda x: (-(x["likeCount"] or 0), -x["_ts"])  # noqa: E731
         key = {
+            "MOST_USEFUL": useful,
+            "MOST_HELPFUL": lambda x: -x["_helpful"],
             "MOST_RECENT": lambda x: -x["_ts"],
-            "MOST_HELPFUL": lambda x: (-(x["likeCount"] or 0), -x["_ts"]),
-            "POSITIVE_FIRST": lambda x: (-float(x["rating"]), -x["_ts"]),
-            "NEGATIVE_FIRST": lambda x: (float(x["rating"]), -x["_ts"]),
-        }.get(sort)
+            "POSITIVE_FIRST": lambda x: (-self.rating_of(x),) + useful(x),
+            "NEGATIVE_FIRST": lambda x: (self.rating_of(x),) + useful(x),
+        }.get(query.get("sort", "MOST_RECENT"))
         if key is None:
             return 400, "application/json", json.dumps({"error": "invalid sort"})
         items = sorted(items, key=key)
-        chunk = [{k: v for k, v in r.items() if not k.startswith("_")} for r in items[(page - 1) * size: page * size]]
-        body = {"reviewCount": len(items), "response": {"reviewData": chunk}}
+        window = items[(page - 1) * self.page_size: page * self.page_size]
+        chunk = [{k: v for k, v in r.items() if not k.startswith("_")} for r in window if not r["_hidden"]]
+        body = {"reviewCount": len(items), "status": "success", "response": {"page": page, "reviewData": chunk}}
         return 200, "application/json", json.dumps(body)
 
     # -- server -----------------------------------------------------------

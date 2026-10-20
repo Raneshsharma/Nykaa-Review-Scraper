@@ -102,11 +102,12 @@ def run_interactive():
 
     print("\nSort options:")
     print("  1) Most Recent (default)")
-    print("  2) Most Useful / Helpful")
-    print("  3) Highest Rated First")
-    print("  4) Lowest Rated First")
-    sort_choice = input("Select sort option [1-4]: ").strip()
-    sort_map = {"1": "MOST_RECENT", "2": "MOST_HELPFUL", "3": "POSITIVE_FIRST", "4": "NEGATIVE_FIRST"}
+    print("  2) Most Helpful")
+    print("  3) Most Useful")
+    print("  4) Highest Rated First")
+    print("  5) Lowest Rated First")
+    sort_choice = input("Select sort option [1-5]: ").strip()
+    sort_map = {"1": "MOST_RECENT", "2": "MOST_HELPFUL", "3": "MOST_USEFUL", "4": "POSITIVE_FIRST", "5": "NEGATIVE_FIRST"}
     sort = sort_map.get(sort_choice, "MOST_RECENT")
 
     print("\nFilter options:")
@@ -116,11 +117,10 @@ def run_interactive():
     print("  4) 3 Stars Only")
     print("  5) 2 Stars Only")
     print("  6) 1 Star Only")
-    print("  7) Verified Buyers Only")
-    filter_choice = input("Select filter [1-7]: ").strip()
+    filter_choice = input("Select filter [1-6]: ").strip()
     filter_map = {
         "1": "ALL", "2": "STAR_5", "3": "STAR_4", "4": "STAR_3",
-        "5": "STAR_2", "6": "STAR_1", "7": "VERIFIED_BUYER"
+        "5": "STAR_2", "6": "STAR_1"
     }
     filter_by = filter_map.get(filter_choice, "ALL")
 
@@ -183,13 +183,13 @@ def main():
     )
     parser.add_argument(
         "--sort",
-        choices=["MOST_RECENT", "MOST_HELPFUL", "POSITIVE_FIRST", "NEGATIVE_FIRST"],
+        choices=["MOST_RECENT", "MOST_HELPFUL", "MOST_USEFUL", "POSITIVE_FIRST", "NEGATIVE_FIRST"],
         default="MOST_RECENT",
         help="Review sort order.",
     )
     parser.add_argument(
         "--filter",
-        choices=["ALL", "STAR_5", "STAR_4", "STAR_3", "STAR_2", "STAR_1", "VERIFIED_BUYER"],
+        choices=["ALL", "STAR_5", "STAR_4", "STAR_3", "STAR_2", "STAR_1"],
         default="ALL",
         help="Filter reviews by star rating or condition.",
     )
@@ -208,8 +208,8 @@ def main():
     parser.add_argument(
         "--workers", "-w",
         type=int,
-        default=4,
-        help="Parallel page downloads (default: 4). Lower it if you see many 429 rate-limit warnings.",
+        default=8,
+        help="Parallel page downloads (default: 8). Lower it if you see many 429 rate-limit warnings.",
     )
     parser.add_argument(
         "--diagnose",
