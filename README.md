@@ -129,7 +129,7 @@ python app.py
 python main.py --ui
 ```
 
-Then open your browser to **`http://localhost:8000`**.
+Your browser opens automatically at **`http://localhost:8000`** (the exact link is also printed in the terminal; if port 8000 is busy it moves to 8001, 8002, ...). If the page doesn't load, try **`http://127.0.0.1:8000`**, and keep the terminal window open while you use the dashboard.
 
 Features available in the UI:
 - **Instant Product Search**: Type any brand or product name for live auto-suggestions.

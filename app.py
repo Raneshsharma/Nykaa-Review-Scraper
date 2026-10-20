@@ -214,6 +214,56 @@ def download_file(result_id: str, file_format: str):
         raise HTTPException(status_code=400, detail="Invalid format. Supported: csv, excel, json.")
 
 
-if __name__ == "__main__":
+def _bind(family: int, host: str, port: int):
+    import socket
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    if family == socket.AF_INET6:
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    sock.bind((host, port))
+    return sock
+
+
+def run_dashboard(port: int = 8000, open_browser: bool = True):
+    """
+    Starts the dashboard on this computer. Listens on both 127.0.0.1 and ::1, because browsers
+    often try "localhost" over IPv6 first, and moves to the next free port if this one is taken.
+    """
+    import socket
+    import webbrowser
     import uvicorn
-    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)
+
+    sockets = []
+    for candidate in range(port, port + 20):
+        try:
+            sockets = [_bind(socket.AF_INET, "127.0.0.1", candidate)]
+        except OSError:
+            continue  # port in use: try the next one
+        try:
+            sockets.append(_bind(socket.AF_INET6, "::1", candidate))
+        except OSError:
+            pass  # no IPv6 on this machine: IPv4 is enough
+        port = candidate
+        break
+    if not sockets:
+        raise SystemExit(f"No free port between {port} and {port + 19}. Close other servers and try again.")
+
+    url = f"http://localhost:{port}"
+    print("\n" + "=" * 60)
+    print(f"  Nykaa Review Scraper dashboard is running:  {url}")
+    print(f"  (if that doesn't open, use http://127.0.0.1:{port})")
+    print("  Press Ctrl+C to stop.")
+    print("=" * 60 + "\n")
+    if open_browser:
+        threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+
+    server = uvicorn.Server(uvicorn.Config(app, log_level="warning"))
+    server.run(sockets=sockets)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Nykaa Review Scraper web dashboard")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--no-browser", action="store_true", help="Don't open the browser automatically")
+    cli = parser.parse_args()
+    run_dashboard(cli.port, open_browser=not cli.no_browser)

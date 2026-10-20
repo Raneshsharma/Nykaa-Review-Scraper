@@ -225,9 +225,8 @@ def main():
     args = parser.parse_args()
 
     if args.ui:
-        print("Starting Nykaa Scraper Web Dashboard on http://localhost:8000 ...")
-        import uvicorn
-        uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
+        from app import run_dashboard
+        run_dashboard()
         return
 
     # If no target or search provided, run interactive CLI
