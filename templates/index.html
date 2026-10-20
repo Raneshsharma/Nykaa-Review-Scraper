@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nykaa Review Scraper — Extract Any Product Reviews Instantly</title>
+    <meta name="description" content="Fast, reliable Nykaa review scraper that bypasses Akamai bot protection and extracts reviews, ratings, verified buyer badges, and images into CSV, Excel, and JSON.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="background-glow top-left"></div>
+    <div class="background-glow bottom-right"></div>
+
+    <header class="app-header">
+        <div class="header-container">
+            <div class="brand">
+                <div class="brand-icon">
+                    <span class="icon-star">★</span>
+                </div>
+                <div class="brand-text">
+                    <h1>Nykaa Review <span class="highlight">Scraper</span></h1>
+                    <p class="tagline">Akamai WAF Bypasser & Deep Review Intelligence</p>
+                </div>
+            </div>
+            <div class="header-badges">
+                <span class="status-pill status-ready" id="systemStatus">
+                    <span class="pulse-dot"></span> WAF Bypass Ready
+                </span>
+                <a href="https://github.com" target="_blank" class="github-badge" title="Source Code">
+                    v1.0.0
+                </a>
+            </div>
+        </div>
+    </header>
+
+    <main class="main-container">
+        <!-- Input & Search Section -->
+        <section class="card control-card">
+            <h2 class="section-title">Select or Search Any Nykaa Product</h2>
+            <p class="section-desc">Paste a Nykaa product URL, enter a Product ID, or search by product name.</p>
+
+            <form id="scrapeForm" class="scrape-form">
+                <div class="search-input-wrapper">
+                    <div class="input-icon">🔍</div>
+                    <input 
+                        type="text" 
+                        id="targetInput" 
+                        name="target" 
+                        class="text-input" 
+                        placeholder="e.g. https://www.nykaa.com/... or 27905374 or 'Kay Beauty Lipstick'"
+                        autocomplete="off"
+                        required
+                    >
+                    <button type="button" id="clearBtn" class="clear-btn" title="Clear input" style="display: none;">✕</button>
+                    <div id="searchSuggestions" class="search-suggestions" style="display: none;"></div>
+                </div>
+
+                <!-- Quick Presets -->
+                <div class="quick-presets">
+                    <span class="preset-label">Popular Examples:</span>
+                    <button type="button" class="preset-chip" data-target="https://www.nykaa.com/plum-black-rice-niacinamide-txa-10percent-night-clarity-jelly-serum/p/27905374">Plum Jelly Serum</button>
+                    <button type="button" class="preset-chip" data-target="Kay Beauty Matte Liquid Lipstick">Kay Beauty Lipstick</button>
+                    <button type="button" class="preset-chip" data-target="Minimalist 10% Niacinamide Serum">Minimalist Niacinamide</button>
+                    <button type="button" class="preset-chip" data-target="Maybelline Super Stay Matte Ink">Maybelline Matte Ink</button>
+                </div>
+
+                <!-- Scraping Options Grid -->
+                <div class="options-grid">
+                    <div class="option-item">
+                        <label for="reviewLimit" class="field-label">Reviews Limit</label>
+                        <select id="reviewLimit" class="select-input">
+                            <option value="25">First 25 reviews (Fastest)</option>
+                            <option value="50" selected>First 50 reviews (Recommended)</option>
+                            <option value="100">First 100 reviews</option>
+                            <option value="250">First 250 reviews</option>
+                            <option value="0">All available reviews</option>
+                        </select>
+                    </div>
+
+                    <div class="option-item">
+                        <label for="sortOrder" class="field-label">Sort By</label>
+                        <select id="sortOrder" class="select-input">
+                            <option value="MOST_RECENT" selected>Most Recent</option>
+                            <option value="MOST_HELPFUL">Most Useful / Helpful</option>
+                            <option value="POSITIVE_FIRST">Highest Rated First (5★ → 1★)</option>
+                            <option value="NEGATIVE_FIRST">Lowest Rated First (1★ → 5★)</option>
+                        </select>
+                    </div>
+
+                    <div class="option-item">
+                        <label for="filterRating" class="field-label">Filter Ratings</label>
+                        <select id="filterRating" class="select-input">
+                            <option value="ALL" selected>All Ratings (1 - 5 Stars)</option>
+                            <option value="STAR_5">5 Stars Only</option>
+                            <option value="STAR_4">4 Stars Only</option>
+                            <option value="STAR_3">3 Stars Only</option>
+                            <option value="STAR_2">2 Stars Only</option>
+                            <option value="STAR_1">1 Star Only</option>
+                            <option value="VERIFIED_BUYER">Verified Buyers Only</option>
+                            <option value="WITH_IMAGES">With Customer Photos</option>
+                        </select>
+                    </div>
+
+                    <div class="option-item submit-action">
+                        <label class="field-label">&nbsp;</label>
+                        <button type="submit" id="startScrapeBtn" class="btn btn-primary">
+                            <span class="btn-icon">⚡</span> Start Scraping
+                        </button>
+                    </div>
+                </div>
+            </form>
+        </section>
+
+        <!-- Loader & Progress Section -->
+        <section id="loadingSection" class="card loading-card" style="display: none;">
+            <div class="loader-spinner"></div>
+            <h3 id="loaderTitle" class="loader-title">Bypassing WAF & Connecting to Nykaa...</h3>
+            <p id="loaderSubtitle" class="loader-subtitle">Establishing browser-impersonated TLS connection and fetching review pages</p>
+            <div class="progress-bar-container">
+                <div id="progressBar" class="progress-bar-fill indeterminate"></div>
+            </div>
+            <div class="live-ticker" id="liveTicker">Initializing requests...</div>
+        </section>
+
+        <!-- Results Display Section -->
+        <section id="resultsSection" class="results-container" style="display: none;">
+            <!-- Product Header & Summary -->
+            <div class="card product-card">
+                <div class="product-layout">
+                    <div class="product-image-container">
+                        <img id="productImage" src="" alt="Product Thumbnail" class="product-image">
+                    </div>
+                    <div class="product-details">
+                        <div class="product-badge-row">
+                            <span id="productBrand" class="brand-tag">Brand</span>
+                            <span id="productAvailability" class="avail-tag">In Stock</span>
+                            <span id="productIdBadge" class="id-tag">ID: -</span>
+                        </div>
+                        <h2 id="productTitle" class="product-name">Product Name</h2>
+                        <div class="product-pricing-row">
+                            <span id="productPrice" class="price-val">₹-</span>
+                            <span id="productRating" class="rating-badge">★ 4.5</span>
+                            <a id="productLink" href="#" target="_blank" class="view-nykaa-link">View on Nykaa ↗</a>
+                        </div>
+                    </div>
+                    <div class="export-actions">
+                        <span class="export-label">Download Data:</span>
+                        <div class="export-buttons-group">
+                            <button id="downloadCsvBtn" class="btn btn-outline">
+                                <span class="format-icon">📄</span> CSV
+                            </button>
+                            <button id="downloadExcelBtn" class="btn btn-outline excel-btn">
+                                <span class="format-icon">📊</span> Excel (.xlsx)
+                            </button>
+                            <button id="downloadJsonBtn" class="btn btn-outline json-btn">
+                                <span class="format-icon">{ }</span> JSON
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stats & Analytics Dashboard -->
+            <div class="analytics-row">
+                <div class="stat-card">
+                    <span class="stat-icon">📝</span>
+                    <div class="stat-data">
+                        <span class="stat-number" id="statTotalScraped">0</span>
+                        <span class="stat-title">Reviews Scraped</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-icon">⭐</span>
+                    <div class="stat-data">
+                        <span class="stat-number" id="statAvgRating">0.0</span>
+                        <span class="stat-title">Average Rating</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-icon">🛡️</span>
+                    <div class="stat-data">
+                        <span class="stat-number" id="statVerifiedPct">0%</span>
+                        <span class="stat-title">Verified Buyers</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-icon">📷</span>
+                    <div class="stat-data">
+                        <span class="stat-number" id="statWithImages">0</span>
+                        <span class="stat-title">With Images</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Rating Breakdown Chart -->
+            <div class="card chart-card">
+                <h3 class="card-subtitle">Rating Distribution</h3>
+                <div class="star-bars-container" id="starBarsContainer">
+                    <!-- Populated dynamically -->
+                </div>
+            </div>
+
+            <!-- Filter & Search Reviews Inside Scraped Data -->
+            <div class="reviews-header-bar">
+                <div class="reviews-count-text">
+                    <h3 class="section-title">Customer Reviews (<span id="visibleReviewsCount">0</span>)</h3>
+                </div>
+                <div class="reviews-filter-bar">
+                    <input 
+                        type="text" 
+                        id="reviewSearchInput" 
+                        class="text-input filter-input" 
+                        placeholder="Search inside review text (e.g. texture, shade)..."
+                    >
+                    <select id="reviewStarFilter" class="select-input star-filter-select">
+                        <option value="ALL">All Stars</option>
+                        <option value="5">5 Stars Only</option>
+                        <option value="4">4 Stars Only</option>
+                        <option value="3">3 Stars Only</option>
+                        <option value="2">2 Stars Only</option>
+                        <option value="1">1 Star Only</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Reviews Feed / Grid -->
+            <div class="reviews-grid" id="reviewsGrid">
+                <!-- Dynamically populated review cards -->
+            </div>
+        </section>
+    </main>
+
+    <!-- Image Lightbox Modal -->
+    <div id="imageLightbox" class="lightbox-modal" style="display: none;">
+        <span class="lightbox-close" id="lightboxClose">&times;</span>
+        <img class="lightbox-content" id="lightboxImg" alt="Enlarged review photo">
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
