@@ -208,8 +208,8 @@ def main():
     parser.add_argument(
         "--workers", "-w",
         type=int,
-        default=8,
-        help="Parallel page downloads (default: 8). Lower it if you see many 429 rate-limit warnings.",
+        default=12,
+        help="Parallel page downloads (default: 12). Lower it if you see many 429 rate-limit warnings.",
     )
     parser.add_argument(
         "--diagnose",

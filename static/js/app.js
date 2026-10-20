@@ -37,6 +37,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const statAvgRating = document.getElementById("statAvgRating");
     const statVerifiedPct = document.getElementById("statVerifiedPct");
     const statCoverage = document.getElementById("statCoverage");
+    const resultNotice = document.getElementById("resultNotice");
     const starBarsContainer = document.getElementById("starBarsContainer");
 
     const visibleReviewsCount = document.getElementById("visibleReviewsCount");
@@ -209,9 +210,6 @@ document.addEventListener("DOMContentLoaded", () => {
             currentResult = job.data;
             currentResultId = job.result_id;
             displayResults(currentResult, currentResultId);
-            if (currentResult.summary.warning) {
-                alert(currentResult.summary.warning);
-            }
             return;
         }
     }
@@ -291,6 +289,8 @@ document.addEventListener("DOMContentLoaded", () => {
             ? Math.round((summary.verified_buyer_count / summary.total_scraped) * 100) 
             : 0;
         statVerifiedPct.textContent = `${verPct}%`;
+        resultNotice.textContent = summary.warning || "";
+        resultNotice.style.display = summary.warning ? "block" : "none";
         statCoverage.textContent = summary.total_available > 0
             ? `${Math.min(100, Math.round((summary.total_scraped / summary.total_available) * 1000) / 10)}%`
             : "–";

@@ -47,16 +47,18 @@ Nykaa's reviews API (verified against the live site) serves 20 reviews per page 
 
 Each bucket reports its own review count, so the scraper knows when a bucket is complete and doesn't waste requests on it. Very large buckets get a full pass in each sort order that reaches a different window of reviews (Most Useful, Most Helpful, Most Recent).
 
-- **Fast**: pages download in parallel (`--workers`, default 8), each worker with its own browser-impersonated session. Random `429` rate limits are retried on the spot.
+- **Fast**: pages download in parallel (`--workers`, default 12), each worker with its own browser-impersonated session. Random `429` rate limits are retried on the spot.
 - **No silent gaps**: failed pages are retried with back-off and a fresh session, then again in a final recovery pass; if Nykaa keeps refusing, scraping stops early with a warning instead of hanging.
 - **Honest coverage**: Nykaa only serves verified-buyer reviews, and its review count includes reviews it never shows (about 10% on the products tested; the website can't show them either). The summary shows `scraped / reported` and explains the gap.
 
-Measured on the live site (October 2026):
+Measured on the live site (October 2026, 12 workers):
 
-| Product | Reported | Collected | Time |
+| Product | Nykaa's count | Collected | Time |
 |---|---|---|---|
-| Lakme Absolute Kohl Kajal (294157) | 428 | 385 (all Nykaa serves) | 6 s |
-| Lakme Eyeconic Kajal (18430) | 5,428 | 4,920 (identical to an exhaustive 2,000-request crawl) | 2.5 min |
+| Lakme Absolute Kohl Kajal (294157) | 428 | 385 (all Nykaa serves) | 5 s |
+| Dot & Key Vitamin C serum (7329368) | 2,332 | 1,584 (matches an exhaustive brute-force crawl) | 22 s |
+| Lakme Eyeconic Kajal (18430) | 5,428 | 4,920 (matches an exhaustive crawl) | 2 min |
+| Maybelline Super Stay Matte Ink (229917) | 16,418 | 14,967 | 3 min |
 
 ---
 
@@ -221,6 +223,6 @@ Nykaa Scrapper/
 | `sort` | `MOST_RECENT`, `MOST_HELPFUL`, `MOST_USEFUL`, `POSITIVE_FIRST`, `NEGATIVE_FIRST` | Order of the returned reviews |
 | `filter_by` | `ALL`, `STAR_5`, `STAR_4`, `STAR_3`, `STAR_2`, `STAR_1` | Filter criteria |
 | `max_reviews` / `--limit` | Integer, or `None` / `0` for all (default) | Review count ceiling |
-| `workers` / `--workers` | Integer (default 8) | Parallel page downloads |
+| `workers` / `--workers` | Integer (default 12) | Parallel page downloads |
 | `format` | `csv`, `excel`, `json`, `all` | Export file types |
 | `--output` | Directory or file path | Where exports are written (default `output/`) |

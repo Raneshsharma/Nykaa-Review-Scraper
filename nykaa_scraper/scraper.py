@@ -132,7 +132,7 @@ class NykaaScraper:
         timeout: int = 20,
         delay_range: Tuple[float, float] = (0.0, 0.15),
         max_retries: int = 6,
-        workers: int = 8,
+        workers: int = 12,
     ):
         # None = pick the first fingerprint Akamai accepts
         self._impersonate_candidates = [impersonate] if impersonate else list(IMPERSONATE_CANDIDATES)
@@ -793,6 +793,13 @@ class NykaaScraper:
                 for fut in futures:
                     fut.cancel()
 
+        def note_early_end(page_no: int) -> None:
+            """Nykaa stopped serving pages earlier than expected: lower the assumed ceiling."""
+            with lock:
+                if page_no - 1 < ceiling["pages"]:
+                    ceiling["pages"] = max(1, page_no - 1)
+                    logger.info(f"Nykaa serves at most {ceiling['pages']} pages per query.")
+
         def crawl(bucket: Bucket, p_sort: str) -> Tuple[bool, int]:
             """
             Fetches every page of one (bucket, sort) query, in parallel, until the bucket is complete.
@@ -829,11 +836,7 @@ class NykaaScraper:
                     if res.status == PAGE_OK:
                         ok_pages += 1
                     elif res.status == PAGE_END and res.page_no <= last_page:
-                        # Nykaa stopped serving pages earlier than expected: lower the ceiling
-                        with lock:
-                            if res.page_no - 1 < ceiling["pages"]:
-                                ceiling["pages"] = max(1, res.page_no - 1)
-                                logger.info(f"Nykaa serves at most {ceiling['pages']} pages per query.")
+                        note_early_end(res.page_no)
                     report()
                     if done() or bucket_done(bucket):
                         break
@@ -842,6 +845,51 @@ class NykaaScraper:
                 for fut in futures:
                     fut.cancel()
             return ok_pages == len(futures), collected_in(bucket) - before
+
+        def crawl_small_buckets(buckets: List[Bucket]) -> None:
+            """
+            Crawls many buckets that each fit in one query with a single shared batch of page
+            requests, so workers stay busy even when every bucket is only a few pages long.
+            A bucket whose pages were all read successfully is complete.
+            """
+            p_sort = sorts_for(buckets[0])[0] if buckets else CRAWL_SORTS[0]
+            jobs: Dict[Any, Tuple[Bucket, int]] = {}
+            pending: Dict[Bucket, int] = {}
+            for b in buckets:
+                first = first_pages.get((b, p_sort))
+                if first is None or first.status != PAGE_OK or bucket_done(b):
+                    continue
+                crawled.add((b, p_sort))
+                count = bucket_counts.get(b) or 0
+                last_page = min(ceiling["pages"], max(1, math.ceil(count / API_PAGE_SIZE)))
+                pending[b] = last_page - 1
+                if last_page < 2:
+                    exhausted.add(b)
+                    continue
+                for pno in range(2, last_page + 1):
+                    jobs[executor.submit(fetch, b, p_sort, pno)] = (b, pno)
+            if jobs:
+                logger.info(f"Crawling {len(pending)} smaller groups together ({len(jobs)} pages). Collected {len(all_reviews)}/{total_available or '?'}")
+            failed: Set[Bucket] = set()
+            try:
+                for fut in as_completed(jobs):
+                    b, pno = jobs[fut]
+                    res = fut.result()
+                    handle_page(b, p_sort, res)
+                    if res.status == PAGE_ERROR:
+                        failed.add(b)
+                    elif res.status == PAGE_END:
+                        note_early_end(pno)
+                    report()
+                    if done():
+                        break
+                    self._check_cancelled()
+            finally:
+                for fut in jobs:
+                    fut.cancel()
+            for b in pending:
+                if b not in failed and bucket_counts.get(b, 0) <= query_reach():
+                    exhausted.add(b)
 
         def crawl_in_order(bucket: Bucket, p_sort: str) -> None:
             """For limited scrapes: pages in parallel batches but added in page order, so the
@@ -917,6 +965,7 @@ class NykaaScraper:
                 # Split the product by star rating
                 stars = [Bucket(star=k) for k in (5, 4, 3, 2, 1)]
                 prefetch_first_pages(stars, sorts_for(stars[0])[0])
+                crawl_small_buckets([b for b in stars if 0 < bucket_counts.get(b, 0) <= query_reach()])
                 for star_bucket in stars:
                     complete(star_bucket, depth + 1)
                 return
@@ -930,6 +979,7 @@ class NykaaScraper:
                 new_children = [c for c in list(known_children) if c not in done_children]
                 children = [Bucket(child=c, star=bucket.star) for c in new_children]
                 prefetch_first_pages(children, sorts_for(bucket)[0])
+                crawl_small_buckets([b for b in children if 0 < bucket_counts.get(b, 0) <= query_reach()])
                 for child_bucket in children:
                     if done() or bucket_done(bucket):
                         return
