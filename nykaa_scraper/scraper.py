@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Callable, Tuple, Set
+from urllib.parse import quote_plus
 from curl_cffi import requests
 
 from .models import Review, ProductInfo, RatingSummary, ScrapeResult
@@ -46,8 +47,16 @@ HARD_PAGE_CAP = 200
 PAGE_SIZE_CANDIDATES = [{"pageSize": "100"}, {"pageSize": "50"}, {"size": "50"}, {"limit": "50"}]
 
 
+# Stop hammering Nykaa once this many page requests in a row have failed every retry
+MAX_CONSECUTIVE_FAILED_PAGES = 12
+
+
 class ScrapeCancelled(Exception):
-    """Raised internally when a caller cancels a running scrape."""
+    """Raised when a caller cancels a scrape before any reviews could be collected."""
+
+
+class _Blocked(Exception):
+    """Internal: Nykaa keeps refusing requests; stop and return what we have."""
 
 
 @dataclass
@@ -221,8 +230,7 @@ class NykaaScraper:
         Returns list of dicts with id, name, slug, and url.
         """
         self._ensure_session()
-        formatted_query = query.strip().replace(" ", "+")
-        search_url = f"{self.BASE_URL}/search/result/?q={formatted_query}"
+        search_url = f"{self.BASE_URL}/search/result/?q={quote_plus(query.strip())}"
 
         try:
             resp = self.session.get(
@@ -547,8 +555,15 @@ class NykaaScraper:
         max_reviews: stop after this many unique reviews (None = all).
         progress_callback(collected, total_available, pages_fetched) is called as pages arrive.
         cancel_event: set it from another thread to stop early; the reviews collected so far are returned.
+        Raises ScrapeCancelled if cancelled before the crawl itself started.
         """
         self._cancel_event = cancel_event
+        try:
+            return self._scrape(target, max_reviews, sort, filter_by, progress_callback)
+        finally:
+            self._cancel_event = None
+
+    def _scrape(self, target, max_reviews, sort, filter_by, progress_callback) -> ScrapeResult:
         self._extra_params = {}
         sort = sort if sort in ALL_SORTS else "MOST_RECENT"
         if filter_by == "ALL":
@@ -600,6 +615,8 @@ class NykaaScraper:
         failed_pages: List[Tuple[Optional[str], str, int]] = []
         crawled: Set[Tuple[Optional[str], str]] = set()
         pages_fetched = 0
+        consecutive_failures = 0
+        warning = ""
         lock = threading.Lock()
 
         def add_reviews(reviews: List[Review]) -> int:
@@ -617,7 +634,10 @@ class NykaaScraper:
         def report():
             if progress_callback:
                 try:
-                    progress_callback(len(all_reviews), total_available, pages_fetched)
+                    collected = len(all_reviews)
+                    if max_reviews:
+                        collected = min(collected, max_reviews)
+                    progress_callback(collected, target_count or total_available, pages_fetched)
                 except Exception:
                     pass
 
@@ -632,6 +652,16 @@ class NykaaScraper:
             if star not in STAR_FILTERS or star not in filter_totals:
                 return False
             return star_counts_seen[int(star[-1])] >= filter_totals[star]
+
+        def track(res: PageResult):
+            """Counts consecutive failed pages; trips the circuit breaker when Nykaa keeps refusing."""
+            nonlocal consecutive_failures
+            if res.status == PAGE_ERROR:
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILED_PAGES:
+                    raise _Blocked()
+            else:
+                consecutive_failures = 0
 
         def crawl_partition(p_filter: Optional[str], p_sort: str, first: Optional[PageResult] = None):
             nonlocal pages_fetched
@@ -648,7 +678,9 @@ class NykaaScraper:
 
             if first.status == PAGE_ERROR:
                 failed_pages.append((p_filter, p_sort, 1))
+                track(first)
                 return
+            track(first)
             if first.status == PAGE_END:
                 if p_filter:
                     filter_totals.setdefault(p_filter, 0)
@@ -686,7 +718,9 @@ class NykaaScraper:
                     pages_fetched += 1
                     if res.status == PAGE_ERROR:
                         failed_pages.append((p_filter, p_sort, res.page_no))
+                        track(res)
                         continue
+                    track(res)
                     if res.status == PAGE_END:
                         ended = True
                         break
@@ -766,13 +800,21 @@ class NykaaScraper:
                         still_failed += 1
                 still_failed += len(failed_pages)  # pages that failed again inside re-crawled partitions
                 if still_failed:
-                    logger.warning(f"{still_failed} page(s) could not be fetched even after retrying.")
+                    warning = f"{still_failed} page(s) could not be fetched even after retrying; some reviews may be missing."
+                    logger.warning(warning)
 
-        except ScrapeCancelled:
+        except (ScrapeCancelled, KeyboardInterrupt):
+            # KeyboardInterrupt: Ctrl+C in the CLI keeps what was collected
+            warning = "Stopped early by user."
             logger.warning("Scrape cancelled; returning the reviews collected so far.")
+        except _Blocked:
+            warning = (
+                "Nykaa kept refusing requests (blocked or rate limited), so scraping stopped early. "
+                "Wait a few minutes and try again, or use fewer workers."
+            )
+            logger.error(warning)
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
-            self._cancel_event = None
 
         if max_reviews:
             all_reviews = all_reviews[:max_reviews]
@@ -799,6 +841,7 @@ class NykaaScraper:
             average_rating=avg_rating,
             star_distribution=star_counts,
             verified_buyer_count=verified_count,
+            warning=warning,
         )
 
         coverage = f" ({total_scraped / total_available * 100:.1f}% of {total_available} reported)" if total_available else ""

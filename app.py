@@ -4,6 +4,7 @@ Provides a REST API and a modern web dashboard.
 """
 
 import uuid
+import shutil
 import tempfile
 import threading
 from typing import Optional, Dict, Any
@@ -13,8 +14,9 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
-from nykaa_scraper import NykaaScraper, ScrapeResult
+from nykaa_scraper import NykaaScraper, ScrapeResult, ScrapeCancelled
 from nykaa_scraper.exporter import export_to_csv, export_to_excel, export_to_json
 from nykaa_scraper.utils import logger
 
@@ -33,6 +35,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # In-memory storage for finished results (by result_id) and running jobs (by job_id)
 MAX_CACHED_RESULTS = 20
+MAX_FINISHED_JOBS = 50
 scrape_cache: Dict[str, ScrapeResult] = {}
 jobs: Dict[str, Dict[str, Any]] = {}
 jobs_lock = threading.Lock()
@@ -70,6 +73,14 @@ def _run_job(job_id: str, target: str, limit: Optional[int], sort: str, filter_v
     def progress(collected, total, pages):
         job.update(collected=collected, total=total, pages=pages)
 
+    def prune_jobs():
+        """Forget the oldest finished jobs (and their cached results) once there are too many."""
+        with jobs_lock:
+            finished = [jid for jid, j in jobs.items() if j["status"] != "running"]
+            for jid in finished[:-MAX_FINISHED_JOBS]:
+                jobs.pop(jid, None)
+                scrape_cache.pop(jid, None)
+
     try:
         # A fresh scraper per job: sessions and cooldown state are not shared between scrapes
         result = NykaaScraper().scrape(
@@ -87,16 +98,23 @@ def _run_job(job_id: str, target: str, limit: Optional[int], sort: str, filter_v
             while len(scrape_cache) > MAX_CACHED_RESULTS:
                 scrape_cache.pop(next(iter(scrape_cache)))
 
-        # Also save to output folder
+        # Also save to output folder; a failed save must not throw away a finished scrape
         base_name = f"nykaa_reviews_{result.product.id}_{result_id}"
-        export_to_csv(result, str(OUTPUT_DIR / f"{base_name}.csv"))
-        export_to_excel(result, str(OUTPUT_DIR / f"{base_name}.xlsx"))
-        export_to_json(result, str(OUTPUT_DIR / f"{base_name}.json"))
+        try:
+            export_to_csv(result, str(OUTPUT_DIR / f"{base_name}.csv"))
+            export_to_excel(result, str(OUTPUT_DIR / f"{base_name}.xlsx"))
+            export_to_json(result, str(OUTPUT_DIR / f"{base_name}.json"))
+        except Exception:
+            logger.exception("Could not save exports to the output folder")
 
         job.update(status="done", result_id=result_id, collected=result.summary.total_scraped)
+    except ScrapeCancelled:
+        job.update(status="cancelled")
     except Exception as e:
         logger.exception("Scrape job failed")
-        job.update(status="error", error=str(e))
+        job.update(status="error", error=str(e) or e.__class__.__name__)
+    finally:
+        prune_jobs()
 
 
 @app.post("/api/scrape")
@@ -131,8 +149,11 @@ def job_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
     body = {k: v for k, v in job.items() if k != "cancel"}
-    if job["status"] == "done" and job["result_id"] in scrape_cache:
-        body["data"] = scrape_cache[job["result_id"]].to_dict()
+    if job["status"] == "done":
+        if job["result_id"] in scrape_cache:
+            body["data"] = scrape_cache[job["result_id"]].to_dict()
+        else:
+            body.update(status="error", error="This result has expired. Please scrape again.")
     return body
 
 
@@ -154,8 +175,11 @@ def download_file(result_id: str, file_format: str):
 
     result = scrape_cache[result_id]
     fmt = file_format.lower().replace(".", "")
+    if fmt not in ("csv", "xlsx", "excel", "json"):
+        raise HTTPException(status_code=400, detail="Invalid format. Supported: csv, excel, json.")
 
-    temp_dir = Path(tempfile.gettempdir())
+    # A unique folder per download, so concurrent downloads never overwrite each other's file
+    temp_dir = Path(tempfile.mkdtemp(prefix="nykaa_dl_"))
     sanitized_name = "".join(c for c in result.product.name if c.isalnum() or c in (" ", "_", "-")).rstrip()[:40]
     filename_base = f"nykaa_{result.product.id}_{sanitized_name}".replace(" ", "_")
 
@@ -164,6 +188,7 @@ def download_file(result_id: str, file_format: str):
         export_to_csv(result, str(out_file))
         return FileResponse(
             out_file,
+            background=BackgroundTask(shutil.rmtree, temp_dir, True),
             filename=f"{filename_base}.csv",
             media_type="text/csv",
         )
@@ -172,6 +197,7 @@ def download_file(result_id: str, file_format: str):
         export_to_excel(result, str(out_file))
         return FileResponse(
             out_file,
+            background=BackgroundTask(shutil.rmtree, temp_dir, True),
             filename=f"{filename_base}.xlsx",
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
@@ -180,6 +206,7 @@ def download_file(result_id: str, file_format: str):
         export_to_json(result, str(out_file))
         return FileResponse(
             out_file,
+            background=BackgroundTask(shutil.rmtree, temp_dir, True),
             filename=f"{filename_base}.json",
             media_type="application/json",
         )

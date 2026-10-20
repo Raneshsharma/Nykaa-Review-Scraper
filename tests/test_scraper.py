@@ -126,3 +126,56 @@ def test_text_helpers():
     assert safe_int("4.0") == 4
     assert safe_int(None) == 0
     assert safe_int("x", 3) == 3
+
+
+def test_cancel_before_crawl_raises_cancelled(mock_api):
+    from nykaa_scraper import ScrapeCancelled
+    mock_api(n_reviews=100)
+    cancel = threading.Event()
+    cancel.set()
+    scraper = fast_scraper()
+    with pytest.raises(ScrapeCancelled):
+        scraper.scrape(URL, cancel_event=cancel)
+    assert scraper._cancel_event is None
+
+
+def test_circuit_breaker_stops_when_blocked(mock_api):
+    # Probe succeeds, then every request fails: must give up quickly with a warning
+    mock = mock_api(n_reviews=2000)
+    real_handle = mock.handle
+
+    def handle(path, query):
+        if "/reviews" in path and mock.requests > 3:
+            with mock.lock:
+                mock.requests += 1
+            return 500, "text/plain", "blocked"
+        return real_handle(path, query)
+
+    mock.handle = handle
+    start = time.time()
+    result = fast_scraper(max_retries=1).scrape(URL)
+    assert time.time() - start < 30
+    assert "refusing" in result.summary.warning
+    assert 0 < len(result.reviews) < 2000
+
+
+def test_progress_respects_limit(mock_api):
+    mock_api(n_reviews=500)
+    seen = []
+    fast_scraper().scrape(URL, max_reviews=30, progress_callback=lambda c, t, p: seen.append((c, t)))
+    assert seen and all(c <= 30 and t == 30 for c, t in seen)
+
+
+def test_search_query_is_url_encoded(mock_api, monkeypatch):
+    mock_api(n_reviews=10)
+    scraper = fast_scraper()
+    scraper._ensure_session()
+    urls = []
+
+    class Resp:
+        status_code = 200
+        text = ""
+
+    monkeypatch.setattr(scraper.session, "get", lambda url, **kw: urls.append(url) or Resp())
+    scraper.search_products("Dot & Key serum")
+    assert urls[0].endswith("q=Dot+%26+Key+serum")

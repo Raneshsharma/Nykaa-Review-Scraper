@@ -133,6 +133,8 @@ document.addEventListener("DOMContentLoaded", () => {
     // --- Form Submission & Scraping Execution ---
     scrapeForm.addEventListener("submit", async (e) => {
         e.preventDefault();
+        // Preset chips / suggestions call requestSubmit(), which ignores the disabled button
+        if (currentJobId || startScrapeBtn.disabled) return;
         const target = targetInput.value.trim();
         if (!target) return;
 
@@ -159,7 +161,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 return;
             }
             currentJobId = res.job_id;
-            await pollJob(currentJobId);
+            await pollJob(res.job_id);
         } catch (err) {
             stopScrapingUI();
             alert("Network error: " + err.message);
@@ -173,6 +175,12 @@ document.addEventListener("DOMContentLoaded", () => {
             let job;
             try {
                 const resp = await fetch(`/api/jobs/${jobId}`);
+                if (resp.status === 404) {
+                    stopScrapingUI();
+                    alert("This scrape is no longer known to the server (it may have restarted). Please start again.");
+                    return;
+                }
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 job = await resp.json();
                 networkFailures = 0;
             } catch (err) {
@@ -191,13 +199,19 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             stopScrapingUI();
-            if (job.status === "error") {
+            if (job.status === "cancelled") {
+                return;  // stopped before any reviews were collected
+            }
+            if (job.status === "error" || !job.data) {
                 alert("Scraping Error: " + (job.error || "Failed to fetch reviews."));
                 return;
             }
             currentResult = job.data;
             currentResultId = job.result_id;
             displayResults(currentResult, currentResultId);
+            if (currentResult.summary.warning) {
+                alert(currentResult.summary.warning);
+            }
             return;
         }
     }

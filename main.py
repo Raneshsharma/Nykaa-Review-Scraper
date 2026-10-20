@@ -55,6 +55,8 @@ def print_summary(result):
         bar = "█" * (pct // 4)
         print(f"  {star} Star | {bar:<25} | {count:>4} ({pct:>2}%)")
     print("=" * 60)
+    if result.summary.warning:
+        print(f"WARNING: {result.summary.warning}")
 
 
 def export_result(result, export_fmt, output=None):

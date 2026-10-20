@@ -57,3 +57,24 @@ def test_exports_with_awkward_text(mock_api, tmp_path):
     export_to_excel(result, str(tmp_path / "r.xlsx"))
     wb = load_workbook(tmp_path / "r.xlsx")
     assert wb["Reviews"].max_row == 81
+
+
+def test_expired_result_is_reported_as_error(client):
+    import app as webapp
+    start = client.post("/api/scrape", json={"target": "123456"}).json()
+    job = wait_for(client, start["job_id"])
+    webapp.scrape_cache.pop(job["result_id"])
+    job = client.get(f"/api/jobs/{start['job_id']}").json()
+    assert job["status"] == "error" and "expired" in job["error"]
+
+
+def test_export_failure_keeps_result(client, monkeypatch):
+    import app as webapp
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(webapp, "export_to_excel", boom)
+    start = client.post("/api/scrape", json={"target": "123456"}).json()
+    job = wait_for(client, start["job_id"])
+    assert job["status"] == "done" and len(job["data"]["reviews"]) == 250

@@ -53,6 +53,7 @@ class RatingSummary:
         "5": 0, "4": 0, "3": 0, "2": 0, "1": 0
     })
     verified_buyer_count: int = 0
+    warning: str = ""  # set when the scrape ended early or pages could not be fetched
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
