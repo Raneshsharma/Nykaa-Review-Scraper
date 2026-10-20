@@ -210,6 +210,11 @@ def main():
         help="Parallel page downloads (default: 4). Lower it if you see many 429 rate-limit warnings.",
     )
     parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Probe how Nykaa's reviews API behaves for this product and save a report (for troubleshooting).",
+    )
+    parser.add_argument(
         "--ui",
         action="store_true",
         help="Launch the interactive web UI dashboard.",
@@ -227,6 +232,17 @@ def main():
     target = args.search or args.target
     if not target:
         run_interactive()
+        return
+
+    if args.diagnose:
+        import json
+        report = NykaaScraper().diagnose(target)
+        text = json.dumps(report, indent=2, ensure_ascii=False)
+        print(text)
+        out = Path("output") / f"diagnose_{report['resolved']['product_id']}.json"
+        out.parent.mkdir(exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        print(f"\nSaved diagnostic report to {out.resolve()}")
         return
 
     print_banner()

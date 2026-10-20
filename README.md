@@ -43,6 +43,7 @@ Nykaa's reviews API only serves ~40 pages per query, so one sort order can't rea
 
 - **Fast**: pages are downloaded in parallel (`--workers`, default 4), each worker with its own browser-impersonated session.
 - **No silent gaps**: pages that fail (rate limits, network errors, Akamai blocks) are retried with back-off and a fresh session, then retried again in a final recovery pass.
+- **Self-tuning**: on large products it checks whether the API accepts a bigger page size, and whether filters can be combined (e.g. 5★ + verified buyers) to split an oversized star bucket further. Each is used only after it is verified to work.
 - **Coverage is reported**: the CLI summary, Excel summary sheet and web dashboard show `scraped / total`. If a single star bucket holds more reviews than all sort orders together can reach through the page ceiling, a few percent may remain unreachable; the coverage figure makes that visible.
 
 ---
@@ -88,6 +89,13 @@ python main.py "27905374" --filter STAR_5 --limit 50
 # Only scrape reviews from verified buyers:
 python main.py "27905374" --filter VERIFIED_BUYER --limit 50
 ```
+
+#### Troubleshooting: diagnose the API
+If a product's coverage is below 100%, or scraping fails, run:
+```bash
+python main.py "<product link>" --diagnose
+```
+It probes Nykaa's reviews API for that product (page size, page ceiling, per-filter counts, how much the sort orders overlap, accepted parameters) and saves the report to `output/diagnose_<id>.json`. Share that file when reporting a problem.
 
 #### Interactive CLI Mode:
 Run without arguments to enter the guided step-by-step CLI:
@@ -156,6 +164,17 @@ export_to_json(result, "reviews.json")
 
 ---
 
+## 🧪 Tests
+
+The test suite runs the scraper against a local mock of Nykaa's reviews API (page ceiling, per-filter counts, rate limits, flaky errors, HTML challenge pages, malformed fields), so it needs no network access:
+
+```bash
+pip install pytest httpx
+python -m pytest tests
+```
+
+---
+
 ## 📂 Project Structure
 
 ```
@@ -173,6 +192,7 @@ Nykaa Scrapper/
 │       └── app.js            # Frontend application logic
 ├── templates/
 │   └── index.html            # Web dashboard HTML5 template
+├── tests/                    # Pytest suite + mock Nykaa API
 ├── output/                   # Auto-generated scraped data exports
 ├── app.py                    # FastAPI web application
 ├── main.py                   # CLI entrypoint with flags & interactive mode

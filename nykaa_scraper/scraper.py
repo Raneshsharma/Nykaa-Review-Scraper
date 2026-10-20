@@ -41,6 +41,10 @@ ALL_SORTS = ["MOST_RECENT", "MOST_HELPFUL", "POSITIVE_FIRST", "NEGATIVE_FIRST"]
 # Absolute safety cap on pages per partition (Nykaa normally stops at ~40)
 HARD_PAGE_CAP = 200
 
+# Page-size parameters the API might honour; each is verified at runtime before use.
+# A bigger page both cuts requests and pushes the ~40-page ceiling further out.
+PAGE_SIZE_CANDIDATES = [{"pageSize": "100"}, {"pageSize": "50"}, {"size": "50"}, {"limit": "50"}]
+
 
 class ScrapeCancelled(Exception):
     """Raised internally when a caller cancels a running scrape."""
@@ -105,6 +109,9 @@ class NykaaScraper:
         self._cooldown_until = 0.0
 
         self._cancel_event: Optional[threading.Event] = None
+
+        # Extra query params (e.g. a verified page size) added to every reviews request
+        self._extra_params: Dict[str, str] = {}
 
     # ------------------------------------------------------------------ #
     # Session handling
@@ -383,9 +390,11 @@ class NykaaScraper:
         sort: str = "MOST_RECENT",
         filter_by: Optional[str] = None,
         referer: Optional[str] = None,
+        extra_params: Optional[Dict[str, str]] = None,
     ) -> PageResult:
         """
         Fetches a single page of reviews from Nykaa's reviews API (thread-safe).
+        extra_params overrides the scraper's tuned extra params for this one request.
         """
         api_url = self.GATEWAY_REVIEWS_URL.format(product_id=product_id)
 
@@ -396,6 +405,7 @@ class NykaaScraper:
         }
         if filter_by and filter_by != "ALL":
             params["filters"] = filter_by
+        params.update(self._extra_params if extra_params is None else extra_params)
 
         headers = {
             "Accept": "application/json, text/plain, */*",
@@ -500,6 +510,28 @@ class NykaaScraper:
             add((None, s))
         return partitions
 
+    def _tune_page_size(
+        self, product_id: str, referer: str, sort: str, filter_by: Optional[str], baseline: int
+    ) -> Optional[PageResult]:
+        """
+        Checks whether the API honours a bigger page size. Adopts the first candidate that
+        returns more reviews than the default page AND pages correctly (page 2 doesn't overlap
+        page 1). Returns that candidate's page 1, or None if the API ignores them all.
+        """
+        for cand in PAGE_SIZE_CANDIDATES:
+            self._check_cancelled()
+            first = self.fetch_reviews_page(product_id, 1, sort, filter_by, referer, extra_params=cand)
+            if first.status != PAGE_OK or len(first.reviews) <= baseline:
+                continue
+            second = self.fetch_reviews_page(product_id, 2, sort, filter_by, referer, extra_params=cand)
+            first_ids = {r.id for r in first.reviews}
+            if second.status == PAGE_END or (second.status == PAGE_OK and not first_ids & {r.id for r in second.reviews}):
+                logger.info(f"API accepts {cand}: {len(first.reviews)} reviews per page instead of {baseline}.")
+                self._extra_params = dict(cand)
+                return first
+        logger.info(f"API uses fixed pages of {baseline} reviews.")
+        return None
+
     def scrape(
         self,
         target: str,
@@ -517,6 +549,7 @@ class NykaaScraper:
         cancel_event: set it from another thread to stop early; the reviews collected so far are returned.
         """
         self._cancel_event = cancel_event
+        self._extra_params = {}
         sort = sort if sort in ALL_SORTS else "MOST_RECENT"
         if filter_by == "ALL":
             filter_by = None
@@ -532,12 +565,11 @@ class NykaaScraper:
         product_info = self.get_product_info(primary_id, canonical_url)
 
         # Step 2: Pick the product ID that actually has reviews
-        first_sort = sort
-        probe = self.fetch_reviews_page(primary_id, 1, first_sort, filter_by, product_info.url)
+        probe = self.fetch_reviews_page(primary_id, 1, sort, filter_by, product_info.url)
         active_id = primary_id
         if probe.status != PAGE_OK and alt_id and alt_id != primary_id:
             logger.info(f"Primary ID {primary_id} returned no reviews. Trying alternate ID {alt_id}...")
-            alt_probe = self.fetch_reviews_page(alt_id, 1, first_sort, filter_by, product_info.url)
+            alt_probe = self.fetch_reviews_page(alt_id, 1, sort, filter_by, product_info.url)
             if alt_probe.status == PAGE_OK:
                 probe, active_id = alt_probe, alt_id
                 product_info.id = alt_id
@@ -555,11 +587,18 @@ class NykaaScraper:
         if max_reviews:
             target_count = min(target_count, max_reviews) if target_count else max_reviews
 
+        # Step 3: Use bigger pages if the API allows it (only worth it beyond a couple of pages)
+        if probe.status == PAGE_OK and (target_count or 0) > 2 * len(probe.reviews):
+            tuned = self._tune_page_size(active_id, product_info.url, sort, filter_by, len(probe.reviews))
+            if tuned:
+                probe = tuned
+
         seen_ids: Set[str] = set()
         all_reviews: List[Review] = []
         star_counts_seen = {i: 0 for i in range(1, 6)}
-        star_totals: Dict[str, int] = {}
+        filter_totals: Dict[str, int] = {}
         failed_pages: List[Tuple[Optional[str], str, int]] = []
+        crawled: Set[Tuple[Optional[str], str]] = set()
         pages_fetched = 0
         lock = threading.Lock()
 
@@ -587,6 +626,83 @@ class NykaaScraper:
                 return True
             return bool(target_count) and len(all_reviews) >= target_count
 
+        def star_complete(p_filter: Optional[str]) -> bool:
+            """True once every review of this partition's star rating is already collected."""
+            star = p_filter.split(",")[0] if p_filter else ""
+            if star not in STAR_FILTERS or star not in filter_totals:
+                return False
+            return star_counts_seen[int(star[-1])] >= filter_totals[star]
+
+        def crawl_partition(p_filter: Optional[str], p_sort: str, first: Optional[PageResult] = None):
+            nonlocal pages_fetched
+            if (p_filter, p_sort) in crawled or done() or star_complete(p_filter):
+                return
+            crawled.add((p_filter, p_sort))
+            self._check_cancelled()
+            logger.info(f"--- Partition: Filter {p_filter or 'ALL'}, Sort {p_sort} ---")
+
+            # Page 1 is fetched alone to learn page size and the partition's review count
+            if first is None:
+                first = self.fetch_reviews_page(active_id, 1, p_sort, p_filter, product_info.url)
+            pages_fetched += 1
+
+            if first.status == PAGE_ERROR:
+                failed_pages.append((p_filter, p_sort, 1))
+                return
+            if first.status == PAGE_END:
+                if p_filter:
+                    filter_totals.setdefault(p_filter, 0)
+                return
+            if p_filter and first.total_count:
+                filter_totals.setdefault(p_filter, first.total_count)
+
+            partition_ids: Set[str] = {r.id for r in first.reviews}
+            new_added = add_reviews(first.reviews)
+            page_size = len(first.reviews)
+            logger.info(f"Page 1: +{page_size} fetched ({new_added} new). Total: {len(all_reviews)}/{total_available or '?'}")
+            report()
+
+            # Estimate how many pages this partition has (if Nykaa tells us its count)
+            if first.total_count and page_size:
+                if first.total_count <= page_size:
+                    return
+                last_page = min(math.ceil(first.total_count / page_size), HARD_PAGE_CAP)
+            else:
+                last_page = HARD_PAGE_CAP
+
+            def fetch(pno):
+                time.sleep(random.uniform(*self.delay_range))
+                return self.fetch_reviews_page(active_id, pno, p_sort, p_filter, product_info.url)
+
+            # Remaining pages: concurrent batches, stopping at the first exhausted page
+            next_page = 2
+            while next_page <= last_page and not done() and not star_complete(p_filter):
+                self._check_cancelled()
+                batch = list(range(next_page, min(next_page + self.workers, last_page + 1)))
+                next_page = batch[-1] + 1
+
+                ended = False
+                for res in sorted(executor.map(fetch, batch), key=lambda r: r.page_no):
+                    pages_fetched += 1
+                    if res.status == PAGE_ERROR:
+                        failed_pages.append((p_filter, p_sort, res.page_no))
+                        continue
+                    if res.status == PAGE_END:
+                        ended = True
+                        break
+                    page_ids = {r.id for r in res.reviews}
+                    if page_ids <= partition_ids:
+                        # API is repeating pages it already served: ceiling reached
+                        ended = True
+                        break
+                    partition_ids |= page_ids
+                    new_added = add_reviews(res.reviews)
+                    logger.info(f"Page {res.page_no}: +{len(res.reviews)} fetched ({new_added} new). Total: {len(all_reviews)}/{total_available or '?'}")
+                report()
+                if ended:
+                    break
+
+        sorts = [sort] + [s for s in ALL_SORTS if s != sort]
         partitions = self._build_partitions(sort, filter_by)
         logger.info(
             f"Starting review scraping for '{product_info.name}' "
@@ -596,93 +712,51 @@ class NykaaScraper:
 
         executor = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="nykaa")
         try:
-            for partition_idx, (p_filter, p_sort) in enumerate(partitions):
+            # Phase 1: unfiltered, every star x sort, verified buyers x sort
+            for idx, (p_filter, p_sort) in enumerate(partitions):
                 if done():
                     break
-                self._check_cancelled()
+                crawl_partition(p_filter, p_sort, first=probe if idx == 0 else None)
 
-                # Skip a star partition once every review of that star is already collected
-                if p_filter in star_totals:
-                    star_num = int(p_filter[-1])
-                    if star_totals[p_filter] and star_counts_seen[star_num] >= star_totals[p_filter]:
+            # Phase 2: stars that are still incomplete (too many reviews for the page ceiling).
+            # Split them further with combined filters, if the API supports combining.
+            verified_total = filter_totals.get("VERIFIED_BUYER", 0)
+            if not filter_by and not done():
+                for star in STAR_FILTERS:
+                    if done():
+                        break
+                    if not filter_totals.get(star) or star_complete(star):
                         continue
+                    combo = f"{star},VERIFIED_BUYER"
+                    first = self.fetch_reviews_page(active_id, 1, sort, combo, product_info.url)
+                    supported = (
+                        first.status == PAGE_OK
+                        and 0 < first.total_count < filter_totals[star]
+                        and first.total_count != verified_total
+                        and all(r.rating == int(star[-1]) and r.is_buyer for r in first.reviews)
+                    )
+                    if not supported:
+                        logger.info("API does not support combined filters; skipping deeper split.")
+                        break
+                    logger.info(f"{star} still incomplete; crawling {combo} ({first.total_count} reviews).")
+                    for s in sorts:
+                        crawl_partition(combo, s, first=first if s == sort else None)
 
-                filter_name = p_filter or "ALL"
-                logger.info(f"--- Partition {partition_idx + 1}/{len(partitions)} (Filter: {filter_name}, Sort: {p_sort}) ---")
-
-                # Page 1 is fetched alone to learn page size and the partition's review count
-                if partition_idx == 0 and (p_filter, p_sort) == (filter_by, first_sort):
-                    first = probe
-                else:
-                    first = self.fetch_reviews_page(active_id, 1, p_sort, p_filter, product_info.url)
-                pages_fetched += 1
-
-                if first.status == PAGE_ERROR:
-                    failed_pages.append((p_filter, p_sort, 1))
-                    continue
-                if first.status == PAGE_END:
-                    if p_filter in STAR_FILTERS:
-                        star_totals[p_filter] = 0
-                    continue
-
-                if p_filter in STAR_FILTERS and first.total_count:
-                    star_totals.setdefault(p_filter, first.total_count)
-
-                partition_ids: Set[str] = {r.id for r in first.reviews}
-                new_added = add_reviews(first.reviews)
-                page_size = len(first.reviews)
-                logger.info(f"Page 1: +{page_size} fetched ({new_added} new). Total: {len(all_reviews)}/{total_available or '?'}")
-                report()
-
-                # Estimate how many pages this partition has (if Nykaa tells us its count)
-                if first.total_count and page_size:
-                    est_pages = math.ceil(first.total_count / page_size)
-                    if first.total_count <= page_size:
-                        continue
-                else:
-                    est_pages = HARD_PAGE_CAP
-                last_page = min(est_pages, HARD_PAGE_CAP)
-
-                # Remaining pages: concurrent batches, stopping at the first exhausted page
-                next_page = 2
-                partition_ended = False
-                while next_page <= last_page and not partition_ended and not done():
-                    self._check_cancelled()
-                    batch = list(range(next_page, min(next_page + self.workers, last_page + 1)))
-                    next_page = batch[-1] + 1
-
-                    def fetch(pno, f=p_filter, s=p_sort):
-                        time.sleep(random.uniform(*self.delay_range))
-                        return self.fetch_reviews_page(active_id, pno, s, f, product_info.url)
-
-                    results = list(executor.map(fetch, batch))
-                    for res in sorted(results, key=lambda r: r.page_no):
-                        pages_fetched += 1
-                        if res.status == PAGE_ERROR:
-                            failed_pages.append((p_filter, p_sort, res.page_no))
-                            continue
-                        if res.status == PAGE_END:
-                            partition_ended = True
-                            break
-                        page_ids = {r.id for r in res.reviews}
-                        if page_ids <= partition_ids:
-                            # API is repeating pages it already served: ceiling reached
-                            partition_ended = True
-                            break
-                        partition_ids |= page_ids
-                        new_added = add_reviews(res.reviews)
-                        logger.info(f"Page {res.page_no}: +{len(res.reviews)} fetched ({new_added} new). Total: {len(all_reviews)}/{total_available or '?'}")
-                    report()
-
-            # Step 3: Recovery pass for pages that failed (network / rate limits)
+            # Phase 3: Recovery pass for pages that failed (network / rate limits)
             if failed_pages and not done():
                 logger.info(f"Retrying {len(failed_pages)} failed page(s) after a short pause...")
                 time.sleep(5)
                 still_failed = 0
-                for p_filter, p_sort, pno in failed_pages:
+                retry_list, failed_pages[:] = list(failed_pages), []
+                for p_filter, p_sort, pno in retry_list:
                     if done():
                         break
                     self._check_cancelled()
+                    if pno == 1:
+                        # The whole partition was skipped: crawl it again from the start
+                        crawled.discard((p_filter, p_sort))
+                        crawl_partition(p_filter, p_sort)
+                        continue
                     res = self.fetch_reviews_page(active_id, pno, p_sort, p_filter, product_info.url)
                     pages_fetched += 1
                     if res.status == PAGE_OK:
@@ -690,6 +764,7 @@ class NykaaScraper:
                         report()
                     elif res.status == PAGE_ERROR:
                         still_failed += 1
+                still_failed += len(failed_pages)  # pages that failed again inside re-crawled partitions
                 if still_failed:
                     logger.warning(f"{still_failed} page(s) could not be fetched even after retrying.")
 
@@ -735,3 +810,115 @@ class NykaaScraper:
             reviews=all_reviews,
             scraped_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
+
+    # ------------------------------------------------------------------ #
+    # Diagnostics
+    # ------------------------------------------------------------------ #
+
+    def _raw_reviews_request(self, product_id: str, params: Dict[str, str], referer: str) -> Dict[str, Any]:
+        """One raw reviews call for diagnostics: status, top-level keys, count and IDs."""
+        query = {"domain": "nykaa", "pageNo": "1", "sort": "MOST_RECENT", **params}
+        out: Dict[str, Any] = {"params": query}
+        try:
+            resp = self.session.get(
+                self.GATEWAY_REVIEWS_URL.format(product_id=product_id),
+                params=query,
+                headers={"Accept": "application/json, text/plain, */*", "Referer": referer, "Origin": self.BASE_URL},
+                timeout=self.timeout,
+            )
+            out["http_status"] = resp.status_code
+            try:
+                data = resp.json()
+            except Exception:
+                out["body_start"] = resp.text[:300]
+                return out
+            resp_obj = data.get("response") if isinstance(data.get("response"), dict) else {}
+            items = resp_obj.get("reviewData") or resp_obj.get("data") or data.get("reviews") or []
+            out["top_level_keys"] = sorted(data.keys())
+            out["response_keys"] = sorted(resp_obj.keys())
+            out["reported_count"] = self._extract_total(data)
+            out["items"] = len(items)
+            out["ids"] = [str(i.get("id")) for i in items if isinstance(i, dict)]
+            out["ratings"] = [i.get("rating") for i in items if isinstance(i, dict)]
+            if items and isinstance(items[0], dict):
+                out["review_keys"] = sorted(items[0].keys())
+            # Any numeric fields that might describe paging
+            out["numeric_fields"] = {
+                k: v for src in (data, resp_obj) for k, v in src.items() if isinstance(v, (int, float)) and not isinstance(v, bool)
+            }
+        except Exception as e:
+            out["error"] = str(e)
+        time.sleep(0.3)
+        return out
+
+    def diagnose(self, target: str) -> Dict[str, Any]:
+        """
+        Probes how Nykaa's reviews API behaves for one product: page size, page ceiling,
+        per-filter counts, whether sort orders differ, and which page-size / combined-filter
+        parameters it accepts. Used to tune the crawler; prints nothing itself.
+        """
+        self._ensure_session()
+        report: Dict[str, Any] = {"target": target, "time": datetime.now().isoformat(timespec="seconds")}
+        pid, url, alt = self.resolve_target(target)
+        report["resolved"] = {"product_id": pid, "url": url, "alternate_id": alt}
+        info = self.get_product_info(pid, url)
+        report["product"] = {"name": info.name, "ld_json_review_count": info.total_reviews_count}
+
+        def call(**params):
+            r = self._raw_reviews_request(pid, {k: str(v) for k, v in params.items()}, url)
+            return r
+
+        def brief(r):
+            return {k: r.get(k) for k in ("http_status", "reported_count", "items", "error", "body_start") if k in r}
+
+        base = call()
+        if not base.get("items") and alt:
+            pid = alt
+            base = call()
+            report["resolved"]["used_alternate_id"] = True
+        report["page1"] = {k: v for k, v in base.items() if k not in ("ids", "ratings")}
+        page_size = base.get("items") or 0
+
+        report["filter_counts"] = {
+            f: brief(call(filters=f)) for f in ["STAR_5", "STAR_4", "STAR_3", "STAR_2", "STAR_1", "VERIFIED_BUYER"]
+        }
+
+        report["page_ceiling"] = {str(p): brief(call(pageNo=p)) for p in (2, 39, 40, 41, 45, 60)}
+
+        # Do different sort orders return different reviews inside the biggest star bucket?
+        counts = {f: v.get("reported_count") or 0 for f, v in report["filter_counts"].items() if f.startswith("STAR_")}
+        biggest = max(counts, key=counts.get) if counts else "STAR_5"
+        sort_ids = {}
+        for s in ALL_SORTS:
+            ids = set()
+            for p in (1, 20):
+                ids |= set(call(filters=biggest, sort=s, pageNo=p).get("ids", []))
+            sort_ids[s] = ids
+        report["sort_overlap"] = {
+            "filter": biggest,
+            "pages_sampled": [1, 20],
+            "pairs": {
+                f"{a} vs {b}": len(sort_ids[a] & sort_ids[b])
+                for i, a in enumerate(ALL_SORTS) for b in ALL_SORTS[i + 1:]
+            },
+            "ids_per_sort": {s: len(v) for s, v in sort_ids.items()},
+        }
+
+        report["page_size_params"] = {
+            json.dumps(c): brief(call(**c)) for c in PAGE_SIZE_CANDIDATES
+        }
+        report["default_page_size"] = page_size
+
+        combo_tests = {
+            "comma": {"filters": f"{biggest},VERIFIED_BUYER"},
+            "pipe": {"filters": f"{biggest}|VERIFIED_BUYER"},
+        }
+        report["combined_filters"] = {}
+        for name, params in combo_tests.items():
+            r = call(**params)
+            report["combined_filters"][name] = {**brief(r), "ratings_seen": sorted(set(map(str, r.get("ratings", []))))}
+
+        for s in ("OLDEST", "MOST_OLD", "LEAST_RECENT"):
+            report.setdefault("other_sorts", {})[s] = brief(call(sort=s))
+
+        return report

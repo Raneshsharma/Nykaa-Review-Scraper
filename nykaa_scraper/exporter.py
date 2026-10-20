@@ -41,6 +41,11 @@ def export_to_excel(result: ScrapeResult, file_path: str) -> str:
     """
     Path(file_path).parent.mkdir(parents=True, exist_ok=True)
     df_reviews = reviews_to_dataframe(result.reviews)
+    # openpyxl refuses control characters; strip them so one odd review can't break the export
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    df_reviews = df_reviews.apply(
+        lambda col: col.map(lambda v: ILLEGAL_CHARACTERS_RE.sub("", v) if isinstance(v, str) else v)
+    )
 
     # Summary table
     summary_data = [
