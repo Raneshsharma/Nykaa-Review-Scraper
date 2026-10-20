@@ -16,6 +16,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const loadingSection = document.getElementById("loadingSection");
     const loaderTitle = document.getElementById("loaderTitle");
     const liveTicker = document.getElementById("liveTicker");
+    const progressBar = document.getElementById("progressBar");
+    const stopScrapeBtn = document.getElementById("stopScrapeBtn");
 
     const resultsSection = document.getElementById("resultsSection");
     const productImage = document.getElementById("productImage");
@@ -34,23 +36,25 @@ document.addEventListener("DOMContentLoaded", () => {
     const statTotalScraped = document.getElementById("statTotalScraped");
     const statAvgRating = document.getElementById("statAvgRating");
     const statVerifiedPct = document.getElementById("statVerifiedPct");
-    const statWithImages = document.getElementById("statWithImages");
+    const statCoverage = document.getElementById("statCoverage");
     const starBarsContainer = document.getElementById("starBarsContainer");
 
     const visibleReviewsCount = document.getElementById("visibleReviewsCount");
     const reviewSearchInput = document.getElementById("reviewSearchInput");
     const reviewStarFilter = document.getElementById("reviewStarFilter");
     const reviewsGrid = document.getElementById("reviewsGrid");
+    const showMoreBtn = document.getElementById("showMoreBtn");
 
-    const imageLightbox = document.getElementById("imageLightbox");
-    const lightboxImg = document.getElementById("lightboxImg");
-    const lightboxClose = document.getElementById("lightboxClose");
+    // Rendering thousands of cards at once freezes the page; render in chunks
+    const RENDER_CHUNK = 200;
 
     // State
     let currentResult = null;
     let currentResultId = null;
-    let tickerInterval = null;
+    let currentJobId = null;
     let searchDebounce = null;
+    let filteredReviews = [];
+    let renderedCount = 0;
 
     // --- Input Clear Button & Presets ---
     targetInput.addEventListener("input", () => {
@@ -113,8 +117,8 @@ document.addEventListener("DOMContentLoaded", () => {
             const item = document.createElement("div");
             item.className = "suggestion-item";
             item.innerHTML = `
-                <span class="suggestion-name">${p.name}</span>
-                <span class="suggestion-id">ID: ${p.id}</span>
+                <span class="suggestion-name">${escapeHtml(p.name)}</span>
+                <span class="suggestion-id">ID: ${escapeHtml(p.id)}</span>
             `;
             item.addEventListener("click", () => {
                 targetInput.value = p.url || p.id;
@@ -148,54 +152,95 @@ document.addEventListener("DOMContentLoaded", () => {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload)
             });
-
             const res = await resp.json();
-            stopScrapingUI();
-
             if (!res.success) {
-                alert("Scraping Error: " + (res.error || "Failed to fetch reviews."));
+                stopScrapingUI();
+                alert("Scraping Error: " + (res.error || res.detail || "Failed to start scraping."));
                 return;
             }
-
-            currentResult = res.data;
-            currentResultId = res.result_id;
-            displayResults(currentResult, currentResultId);
-
+            currentJobId = res.job_id;
+            await pollJob(currentJobId);
         } catch (err) {
             stopScrapingUI();
             alert("Network error: " + err.message);
         }
     });
 
+    async function pollJob(jobId) {
+        let networkFailures = 0;
+        while (true) {
+            await new Promise(r => setTimeout(r, 1000));
+            let job;
+            try {
+                const resp = await fetch(`/api/jobs/${jobId}`);
+                job = await resp.json();
+                networkFailures = 0;
+            } catch (err) {
+                // Tolerate brief hiccups while a long scrape is running
+                if (++networkFailures >= 10) {
+                    stopScrapingUI();
+                    alert("Lost connection to the scraper server: " + err.message);
+                    return;
+                }
+                continue;
+            }
+
+            if (job.status === "running") {
+                updateProgress(job.collected, job.total, job.pages);
+                continue;
+            }
+
+            stopScrapingUI();
+            if (job.status === "error") {
+                alert("Scraping Error: " + (job.error || "Failed to fetch reviews."));
+                return;
+            }
+            currentResult = job.data;
+            currentResultId = job.result_id;
+            displayResults(currentResult, currentResultId);
+            return;
+        }
+    }
+
+    stopScrapeBtn.addEventListener("click", async () => {
+        if (!currentJobId) return;
+        stopScrapeBtn.disabled = true;
+        liveTicker.textContent = "Stopping... saving the reviews collected so far.";
+        try {
+            await fetch(`/api/jobs/${currentJobId}/cancel`, { method: "POST" });
+        } catch (err) {
+            console.warn("Cancel failed:", err);
+        }
+    });
+
+    function updateProgress(collected, total, pages) {
+        if (total > 0) {
+            const pct = Math.min(100, Math.round((collected / total) * 100));
+            progressBar.className = "progress-bar-fill determinate";
+            progressBar.style.width = `${pct}%`;
+            loaderTitle.textContent = `Scraping reviews... ${pct}%`;
+            liveTicker.textContent = `Collected ${collected.toLocaleString()} of ${total.toLocaleString()} reviews (${pages} pages fetched)`;
+        } else {
+            liveTicker.textContent = `Collected ${collected.toLocaleString()} reviews (${pages} pages fetched)`;
+        }
+    }
+
     function startScrapingUI() {
         startScrapeBtn.disabled = true;
+        stopScrapeBtn.disabled = false;
         resultsSection.style.display = "none";
         loadingSection.style.display = "block";
-
-        const tickerMessages = [
-            "Initiating browser-grade TLS handshake (Chrome 120)...",
-            "Bypassing Akamai Bot Manager and WAF...",
-            "Fetching product metadata and specifications...",
-            "Resolving internal Nykaa Gateway reviews endpoint...",
-            "Streaming reviews batch and decrypting reviewer labels...",
-            "Extracting customer review photos and verified badges...",
-            "Computing star distribution and sentiment analytics..."
-        ];
-
-        let msgIdx = 0;
-        liveTicker.textContent = tickerMessages[0];
-        tickerInterval = setInterval(() => {
-            msgIdx = (msgIdx + 1) % tickerMessages.length;
-            liveTicker.textContent = tickerMessages[msgIdx];
-        }, 1200);
-
+        progressBar.className = "progress-bar-fill indeterminate";
+        progressBar.style.width = "";
+        loaderTitle.textContent = "Connecting to Nykaa...";
+        liveTicker.textContent = "Resolving product and fetching the first page of reviews...";
         loadingSection.scrollIntoView({ behavior: "smooth" });
     }
 
     function stopScrapingUI() {
         startScrapeBtn.disabled = false;
         loadingSection.style.display = "none";
-        clearInterval(tickerInterval);
+        currentJobId = null;
     }
 
     // --- Display Scraped Results ---
@@ -232,7 +277,9 @@ document.addEventListener("DOMContentLoaded", () => {
             ? Math.round((summary.verified_buyer_count / summary.total_scraped) * 100) 
             : 0;
         statVerifiedPct.textContent = `${verPct}%`;
-        statWithImages.textContent = summary.with_images_count;
+        statCoverage.textContent = summary.total_available > 0
+            ? `${Math.min(100, Math.round((summary.total_scraped / summary.total_available) * 1000) / 10)}%`
+            : "–";
 
         // 4. Rating Distribution Bars
         renderStarBars(summary.star_distribution, summary.total_scraped);
@@ -274,6 +321,9 @@ document.addEventListener("DOMContentLoaded", () => {
     function renderReviewsList(reviews) {
         reviewsGrid.innerHTML = "";
         visibleReviewsCount.textContent = reviews.length;
+        filteredReviews = reviews;
+        renderedCount = 0;
+        showMoreBtn.style.display = "none";
 
         if (reviews.length === 0) {
             reviewsGrid.innerHTML = `
@@ -284,12 +334,19 @@ document.addEventListener("DOMContentLoaded", () => {
             return;
         }
 
-        reviews.forEach(rev => {
+        renderNextChunk();
+    }
+
+    function renderNextChunk() {
+        const chunk = filteredReviews.slice(renderedCount, renderedCount + RENDER_CHUNK);
+        renderedCount += chunk.length;
+
+        chunk.forEach(rev => {
             const card = document.createElement("div");
             card.className = "review-card";
 
             // Initials
-            const initials = rev.reviewer_name
+            const initials = (rev.reviewer_name || "")
                 .split(" ")
                 .filter(Boolean)
                 .slice(0, 2)
@@ -297,14 +354,14 @@ document.addEventListener("DOMContentLoaded", () => {
                 .join("") || "U";
 
             // Stars string
-            const fullStars = "★".repeat(rev.rating);
+            const fullStars = "★".repeat(Math.max(0, Math.min(5, rev.rating)));
             const emptyStars = "☆".repeat(Math.max(0, 5 - rev.rating));
 
             card.innerHTML = `
                 <div>
                     <div class="review-top-row">
                         <div class="reviewer-meta">
-                            <div class="avatar-circle">${initials}</div>
+                            <div class="avatar-circle">${escapeHtml(initials)}</div>
                             <span class="reviewer-name">${escapeHtml(rev.reviewer_name)}</span>
                         </div>
                         <div class="rating-stars">${fullStars}${emptyStars}</div>
@@ -317,7 +374,17 @@ document.addEventListener("DOMContentLoaded", () => {
 
             reviewsGrid.appendChild(card);
         });
+
+        const remaining = filteredReviews.length - renderedCount;
+        if (remaining > 0) {
+            showMoreBtn.textContent = `Show more reviews (${remaining.toLocaleString()} remaining)`;
+            showMoreBtn.style.display = "block";
+        } else {
+            showMoreBtn.style.display = "none";
+        }
     }
+
+    showMoreBtn.addEventListener("click", renderNextChunk);
 
     // --- Search & Filter Reviews within Scraped Results ---
     function filterReviews() {
@@ -342,28 +409,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
     reviewSearchInput.addEventListener("input", filterReviews);
     reviewStarFilter.addEventListener("change", filterReviews);
-
-    // --- Lightbox Modal ---
-    window.openLightbox = function(url) {
-        lightboxImg.src = url;
-        imageLightbox.style.display = "flex";
-    };
-
-    lightboxClose.addEventListener("click", () => {
-        imageLightbox.style.display = "none";
-    });
-
-    imageLightbox.addEventListener("click", (e) => {
-        if (e.target === imageLightbox) {
-            imageLightbox.style.display = "none";
-        }
-    });
-
-    document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape" && imageLightbox.style.display === "flex") {
-            imageLightbox.style.display = "none";
-        }
-    });
 
     function escapeHtml(text) {
         if (!text) return "";

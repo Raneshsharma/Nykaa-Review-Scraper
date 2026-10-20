@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Nykaa Review Scraper — Extract Any Product Reviews Instantly</title>
-    <meta name="description" content="Fast, reliable Nykaa review scraper that bypasses Akamai bot protection and extracts reviews, ratings, verified buyer badges, and images into CSV, Excel, and JSON.">
+    <meta name="description" content="Fast, reliable Nykaa review scraper that bypasses Akamai bot protection and extracts every review, rating and verified buyer badge into CSV, Excel, and JSON.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -72,11 +72,10 @@
                     <div class="option-item">
                         <label for="reviewLimit" class="field-label">Reviews Limit</label>
                         <select id="reviewLimit" class="select-input">
-                            <option value="25">First 25 reviews (Fastest)</option>
-                            <option value="50" selected>First 50 reviews (Recommended)</option>
-                            <option value="100">First 100 reviews</option>
+                            <option value="0" selected>All available reviews</option>
+                            <option value="50">First 50 reviews (Fastest)</option>
                             <option value="250">First 250 reviews</option>
-                            <option value="0">All available reviews</option>
+                            <option value="1000">First 1000 reviews</option>
                         </select>
                     </div>
 
@@ -100,7 +99,6 @@
                             <option value="STAR_2">2 Stars Only</option>
                             <option value="STAR_1">1 Star Only</option>
                             <option value="VERIFIED_BUYER">Verified Buyers Only</option>
-                            <option value="WITH_IMAGES">With Customer Photos</option>
                         </select>
                     </div>
 
@@ -123,6 +121,7 @@
                 <div id="progressBar" class="progress-bar-fill indeterminate"></div>
             </div>
             <div class="live-ticker" id="liveTicker">Initializing requests...</div>
+            <button type="button" id="stopScrapeBtn" class="btn btn-outline stop-btn">Stop &amp; keep reviews collected so far</button>
         </section>
 
         <!-- Results Display Section -->
@@ -187,10 +186,10 @@
                     </div>
                 </div>
                 <div class="stat-card">
-                    <span class="stat-icon">📷</span>
+                    <span class="stat-icon">🎯</span>
                     <div class="stat-data">
-                        <span class="stat-number" id="statWithImages">0</span>
-                        <span class="stat-title">With Images</span>
+                        <span class="stat-number" id="statCoverage">–</span>
+                        <span class="stat-title">Coverage of Nykaa Total</span>
                     </div>
                 </div>
             </div>
@@ -230,14 +229,9 @@
             <div class="reviews-grid" id="reviewsGrid">
                 <!-- Dynamically populated review cards -->
             </div>
+            <button type="button" id="showMoreBtn" class="btn btn-outline show-more-btn" style="display: none;">Show more reviews</button>
         </section>
     </main>
-
-    <!-- Image Lightbox Modal -->
-    <div id="imageLightbox" class="lightbox-modal" style="display: none;">
-        <span class="lightbox-close" id="lightboxClose">&times;</span>
-        <img class="lightbox-content" id="lightboxImg" alt="Enlarged review photo">
-    </div>
 
     <script src="/static/js/app.js"></script>
 </body>

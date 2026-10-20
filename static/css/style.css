@@ -881,39 +881,20 @@ body {
 }
 
 /* Lightbox Modal */
-.lightbox-modal {
-    position: fixed;
-    z-index: 1000;
-    left: 0;
-    top: 0;
-    width: 100%;
+.progress-bar-fill.determinate {
     height: 100%;
-    background-color: rgba(0, 0, 0, 0.88);
-    backdrop-filter: blur(8px);
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    background: var(--nykaa-gradient);
+    border-radius: var(--radius-pill);
+    transition: width 0.4s ease;
 }
 
-.lightbox-content {
-    max-width: 90%;
-    max-height: 85%;
-    border-radius: var(--radius-md);
-    box-shadow: 0 0 30px rgba(0, 0, 0, 0.7);
+.stop-btn {
+    margin-top: 1rem;
 }
 
-.lightbox-close {
-    position: absolute;
-    top: 25px;
-    right: 35px;
-    color: #f1f1f1;
-    font-size: 40px;
-    font-weight: bold;
-    cursor: pointer;
-}
-
-.lightbox-close:hover {
-    color: var(--nykaa-pink);
+.show-more-btn {
+    display: block;
+    margin: 1.5rem auto 0 auto;
 }
 
 /* Responsive */

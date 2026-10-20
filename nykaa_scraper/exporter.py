@@ -49,8 +49,9 @@ def export_to_excel(result: ScrapeResult, file_path: str) -> str:
         {"Attribute": "Brand", "Value": result.product.brand},
         {"Attribute": "Price (INR)", "Value": f"₹{result.product.price}" if result.product.price else "N/A"},
         {"Attribute": "Nykaa URL", "Value": result.product.url},
-        {"Attribute": "Total Reviews on Nykaa", "Value": result.product.total_reviews_count},
+        {"Attribute": "Total Reviews on Nykaa", "Value": result.summary.total_available or result.product.total_reviews_count},
         {"Attribute": "Total Scraped Reviews", "Value": result.summary.total_scraped},
+        {"Attribute": "Coverage", "Value": f"{result.summary.total_scraped / result.summary.total_available * 100:.1f}%" if result.summary.total_available else "N/A"},
         {"Attribute": "Average Rating (Scraped)", "Value": f"{result.summary.average_rating} / 5.0"},
         {"Attribute": "5-Star Reviews", "Value": result.summary.star_distribution.get("5", 0)},
         {"Attribute": "4-Star Reviews", "Value": result.summary.star_distribution.get("4", 0)},
@@ -58,7 +59,6 @@ def export_to_excel(result: ScrapeResult, file_path: str) -> str:
         {"Attribute": "2-Star Reviews", "Value": result.summary.star_distribution.get("2", 0)},
         {"Attribute": "1-Star Reviews", "Value": result.summary.star_distribution.get("1", 0)},
         {"Attribute": "Verified Buyers", "Value": result.summary.verified_buyer_count},
-        {"Attribute": "Reviews With Images", "Value": result.summary.with_images_count},
         {"Attribute": "Scraped At", "Value": result.scraped_at},
     ]
     df_summary = pd.DataFrame(summary_data)
@@ -93,13 +93,13 @@ def export_to_excel(result: ScrapeResult, file_path: str) -> str:
                 for row in ws.iter_rows(min_row=2):
                     for cell in row:
                         cell.border = thin_border
-                        cell.alignment = Alignment(vertical="center")
+                        cell.alignment = Alignment(vertical="top", wrap_text=True)
 
                 # Auto-adjust column widths
                 for col in ws.columns:
                     max_len = 0
                     col_letter = get_column_letter(col[0].column)
-                    for cell in col:
+                    for cell in col[:500]:
                         val_str = str(cell.value or "")
                         if len(val_str) > max_len:
                             max_len = len(val_str)

@@ -2,19 +2,56 @@
 Core Nykaa Review Scraper.
 Uses curl_cffi with browser TLS impersonation to reliably fetch reviews
 bypassing Akamai WAF and rate limitations.
-Implements multi-partition deep scraping to overcome Nykaa's 40-page API ceiling.
+
+Nykaa's reviews API only serves a limited number of pages per query (~40), so a
+single sort order cannot reach every review on popular products. The scraper
+works around this by crawling many "partitions" (star rating x sort order,
+verified buyers x sort order, ...) and de-duplicating by review ID until the
+number of unique reviews matches the count Nykaa reports.
+
+Pages inside a partition are fetched concurrently by a small pool of worker
+threads, each with its own browser-impersonated session. Failed pages are never
+silently dropped: they are retried in a final recovery pass.
 """
 
 import re
 import json
+import math
 import time
 import random
+import threading
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Callable, Tuple, Set
 from curl_cffi import requests
 
 from .models import Review, ProductInfo, RatingSummary, ScrapeResult
-from .utils import extract_product_id, clean_text, logger
+from .utils import extract_product_id, clean_text, safe_int, logger
+
+
+# Page fetch outcomes
+PAGE_OK = "ok"        # page returned reviews
+PAGE_END = "end"      # partition exhausted (empty page or pagination ceiling)
+PAGE_ERROR = "error"  # request failed after all retries; page must be retried later
+
+STAR_FILTERS = ["STAR_5", "STAR_4", "STAR_3", "STAR_2", "STAR_1"]
+ALL_SORTS = ["MOST_RECENT", "MOST_HELPFUL", "POSITIVE_FIRST", "NEGATIVE_FIRST"]
+
+# Absolute safety cap on pages per partition (Nykaa normally stops at ~40)
+HARD_PAGE_CAP = 200
+
+
+class ScrapeCancelled(Exception):
+    """Raised internally when a caller cancels a running scrape."""
+
+
+@dataclass
+class PageResult:
+    status: str
+    reviews: List[Review] = field(default_factory=list)
+    total_count: int = 0
+    page_no: int = 0
 
 
 class NykaaScraper:
@@ -40,31 +77,43 @@ class NykaaScraper:
         "STAR_2": "2 Star",
         "STAR_1": "1 Star",
         "VERIFIED_BUYER": "Verified Buyers",
-        "WITH_IMAGES": "With Images",
     }
 
     def __init__(
         self,
         impersonate: str = "chrome120",
-        timeout: int = 15,
-        delay_range: Tuple[float, float] = (0.9, 1.6),
+        timeout: int = 20,
+        delay_range: Tuple[float, float] = (0.15, 0.45),
         max_retries: int = 5,
+        workers: int = 4,
     ):
         self.impersonate = impersonate
         self.timeout = timeout
         self.delay_range = delay_range
         self.max_retries = max_retries
+        self.workers = max(1, workers)
+
+        # Main session (product page, search, first-page probes)
         self.session = requests.Session(impersonate=self.impersonate)
         self._session_initialized = False
 
-    def _ensure_session(self, force_refresh: bool = False):
-        """Initializes cookies and session headers by visiting homepage if not already done."""
-        if self._session_initialized and not force_refresh:
-            return
+        # Per-thread sessions for concurrent page fetching (curl handles are not thread-safe)
+        self._local = threading.local()
 
+        # Shared back-off: when any worker is rate limited, every worker pauses
+        self._cooldown_lock = threading.Lock()
+        self._cooldown_until = 0.0
+
+        self._cancel_event: Optional[threading.Event] = None
+
+    # ------------------------------------------------------------------ #
+    # Session handling
+    # ------------------------------------------------------------------ #
+
+    def _warm_session(self, session: requests.Session) -> bool:
+        """Visits the homepage so Akamai issues its cookies to this session."""
         try:
-            logger.info("Initializing Nykaa browser session...")
-            resp = self.session.get(
+            resp = session.get(
                 self.BASE_URL,
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -73,12 +122,91 @@ class NykaaScraper:
                 timeout=self.timeout,
             )
             if resp.status_code == 200:
-                self._session_initialized = True
-                logger.info("Nykaa session initialized successfully.")
-            else:
-                logger.warning(f"Session init returned status {resp.status_code}")
+                return True
+            logger.warning(f"Session init returned status {resp.status_code}")
         except Exception as e:
             logger.warning(f"Session initialization warning: {e}")
+        return False
+
+    def _ensure_session(self, force_refresh: bool = False):
+        """Initializes cookies and session headers by visiting homepage if not already done."""
+        if self._session_initialized and not force_refresh:
+            return
+        if force_refresh:
+            self.session = requests.Session(impersonate=self.impersonate)
+        logger.info("Initializing Nykaa browser session...")
+        self._session_initialized = self._warm_session(self.session)
+        if self._session_initialized:
+            logger.info("Nykaa session initialized successfully.")
+
+    def _thread_session(self, force_refresh: bool = False) -> requests.Session:
+        """Returns the calling thread's own session, creating and warming it if needed."""
+        if threading.current_thread() is threading.main_thread() and not hasattr(self._local, "session"):
+            # The main thread reuses the already-warm main session
+            self._local.session = self.session
+        if force_refresh or not hasattr(self._local, "session"):
+            sess = requests.Session(impersonate=self.impersonate)
+            self._warm_session(sess)
+            self._local.session = sess
+        return self._local.session
+
+    def _wait_for_cooldown(self):
+        while True:
+            self._check_cancelled()
+            with self._cooldown_lock:
+                remaining = self._cooldown_until - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.5))
+
+    def _set_cooldown(self, seconds: float):
+        with self._cooldown_lock:
+            self._cooldown_until = max(self._cooldown_until, time.time() + seconds)
+
+    def _check_cancelled(self):
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise ScrapeCancelled()
+
+    # ------------------------------------------------------------------ #
+    # Target resolution, search and product metadata
+    # ------------------------------------------------------------------ #
+
+    def resolve_target(self, target: str) -> Tuple[str, str, Optional[str]]:
+        """
+        Turns a URL / product ID / search query into (product_id, product_url, alternate_id).
+        Follows redirects for share / short links (e.g. nykaa.app.link) that have no ID in them.
+        """
+        target = target.strip()
+        primary_id, canonical_url, alt_id = extract_product_id(target)
+        if primary_id:
+            return primary_id, canonical_url, alt_id
+
+        looks_like_url = target.lower().startswith(("http://", "https://")) or re.match(r"^[\w.-]+\.[a-z]{2,}/", target, re.I)
+        if looks_like_url:
+            url = target if target.lower().startswith("http") else f"https://{target}"
+            self._ensure_session()
+            try:
+                resp = self.session.get(url, allow_redirects=True, timeout=self.timeout)
+                pid, curl, aid = extract_product_id(str(resp.url))
+                if pid:
+                    return pid, curl, aid
+                # Some share links land on an HTML page that embeds the canonical product URL
+                m = re.search(r'https?://www\.nykaa\.com/[^"\'\s]*/p/\d+[^"\'\s]*', resp.text)
+                if m:
+                    pid, curl, aid = extract_product_id(m.group(0))
+                    if pid:
+                        return pid, curl, aid
+            except Exception as e:
+                logger.warning(f"Could not follow link '{target}': {e}")
+            raise ValueError(f"Could not find a Nykaa product ID in link: '{target}'")
+
+        logger.info(f"Target '{target}' is not a direct URL/ID. Searching Nykaa...")
+        search_matches = self.search_products(target, limit=1)
+        if not search_matches:
+            raise ValueError(f"Could not find any product matching search term: '{target}'")
+        first_match = search_matches[0]
+        logger.info(f"Resolved search to product: '{first_match['name']}' (ID: {first_match['id']})")
+        return first_match["id"], first_match["url"], None
 
     def search_products(self, query: str, limit: int = 6) -> List[Dict[str, str]]:
         """
@@ -148,35 +276,43 @@ class NykaaScraper:
             if resp.status_code == 200:
                 html_text = resp.text
 
-                # 1. Try extracting structured data from application/ld+json
-                ld_match = re.search(r'<script type="application/ld\+json">(.*?)</script>', html_text, re.DOTALL)
-                if ld_match:
+                # 1. Try extracting structured data from application/ld+json (pages can carry several blocks)
+                for ld_block in re.findall(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', html_text, re.DOTALL):
                     try:
-                        data = json.loads(ld_match.group(1))
-                        items = data if isinstance(data, list) else [data]
-                        for item in items:
-                            if item.get("@type") == "Product":
-                                info.name = clean_text(item.get("name") or "")
-                                brand_val = item.get("brand")
-                                if isinstance(brand_val, dict):
-                                    info.brand = brand_val.get("name", "")
-                                elif isinstance(brand_val, str):
-                                    info.brand = brand_val
-
-                                info.image_url = item.get("image") or ""
-                                offers = item.get("offers")
-                                if isinstance(offers, dict):
-                                    info.price = offers.get("price")
-                                    info.currency = offers.get("priceCurrency", "INR")
-                                    info.availability = offers.get("availability", "").replace("http://schema.org/", "")
-
-                                agg = item.get("aggregateRating")
-                                if isinstance(agg, dict):
-                                    info.average_rating = float(agg.get("ratingValue", 0)) if agg.get("ratingValue") else None
-                                    info.total_reviews_count = int(agg.get("reviewCount", 0)) if agg.get("reviewCount") else 0
-                                break
+                        data = json.loads(ld_block)
                     except Exception as json_err:
                         logger.debug(f"Could not parse ld+json: {json_err}")
+                        continue
+                    items = data if isinstance(data, list) else data.get("@graph", [data]) if isinstance(data, dict) else []
+                    product_item = next((i for i in items if isinstance(i, dict) and i.get("@type") == "Product"), None)
+                    if not product_item:
+                        continue
+
+                    info.name = clean_text(product_item.get("name") or "")
+                    brand_val = product_item.get("brand")
+                    if isinstance(brand_val, dict):
+                        info.brand = brand_val.get("name", "")
+                    elif isinstance(brand_val, str):
+                        info.brand = brand_val
+
+                    image_val = product_item.get("image") or ""
+                    info.image_url = image_val[0] if isinstance(image_val, list) and image_val else str(image_val)
+                    offers = product_item.get("offers")
+                    if isinstance(offers, list) and offers:
+                        offers = offers[0]
+                    if isinstance(offers, dict):
+                        info.price = offers.get("price")
+                        info.currency = offers.get("priceCurrency", "INR")
+                        info.availability = str(offers.get("availability", "")).replace("https://schema.org/", "").replace("http://schema.org/", "")
+
+                    agg = product_item.get("aggregateRating")
+                    if isinstance(agg, dict):
+                        try:
+                            info.average_rating = float(agg["ratingValue"]) if agg.get("ratingValue") else None
+                        except (TypeError, ValueError):
+                            pass
+                        info.total_reviews_count = safe_int(agg.get("reviewCount"))
+                    break
 
                 # 2. Fallbacks using OpenGraph meta tags if fields are missing
                 if not info.name:
@@ -202,6 +338,44 @@ class NykaaScraper:
 
         return info
 
+    # ------------------------------------------------------------------ #
+    # Reviews API
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _parse_review(item: Dict[str, Any]) -> Optional[Review]:
+        """Converts one raw API review into a Review. Never raises on odd/missing fields."""
+        review_id = item.get("id") or item.get("reviewId")
+        if review_id in (None, ""):
+            return None
+        rating = safe_int(item.get("rating"), default=0)
+        return Review(
+            id=str(review_id),
+            child_id=str(item["childId"]) if item.get("childId") else None,
+            title=clean_text(item.get("title")),
+            description=clean_text(item.get("description")),
+            reviewer_name=clean_text(item.get("name")) or "Anonymous",
+            rating=min(max(rating, 0), 5),
+            created_on=str(item.get("createdOn") or ""),
+            relative_date=str(item.get("reviewCreationTextV2") or item.get("reviewCreationText") or ""),
+            is_buyer=bool(item.get("isBuyer")),
+            label=clean_text(item.get("label")),
+            like_count=safe_int(item.get("likeCount")),
+            customer_profile_url=str(item.get("customerProfileUrl") or ""),
+            user_review_count=safe_int(item.get("userReviewCount")),
+            pro_user=bool(item.get("proUser")),
+        )
+
+    @staticmethod
+    def _extract_total(data: Dict[str, Any]) -> int:
+        resp_obj = data.get("response") if isinstance(data.get("response"), dict) else {}
+        for container in (data, resp_obj):
+            for key in ("reviewCount", "totalCount", "total"):
+                val = safe_int(container.get(key))
+                if val:
+                    return val
+        return 0
+
     def fetch_reviews_page(
         self,
         product_id: str,
@@ -209,13 +383,10 @@ class NykaaScraper:
         sort: str = "MOST_RECENT",
         filter_by: Optional[str] = None,
         referer: Optional[str] = None,
-    ) -> Tuple[List[Review], int, bool]:
+    ) -> PageResult:
         """
-        Fetches a single page of reviews from Nykaa's reviews API.
-        Returns:
-            (reviews, total_count, is_partition_exhausted)
+        Fetches a single page of reviews from Nykaa's reviews API (thread-safe).
         """
-        self._ensure_session()
         api_url = self.GATEWAY_REVIEWS_URL.format(product_id=product_id)
 
         params: Dict[str, Any] = {
@@ -233,215 +404,308 @@ class NykaaScraper:
             "Origin": self.BASE_URL,
         }
 
-        reviews: List[Review] = []
-        total_count = 0
+        session = self._thread_session()
 
         for attempt in range(1, self.max_retries + 1):
+            self._wait_for_cooldown()
             try:
-                resp = self.session.get(api_url, params=params, headers=headers, timeout=self.timeout)
+                resp = session.get(api_url, params=params, headers=headers, timeout=self.timeout)
 
                 if resp.status_code == 200:
-                    data = resp.json()
-                    total_count = data.get("reviewCount", 0)
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        # Akamai sometimes serves an HTML challenge with status 200
+                        logger.warning(f"Non-JSON response on page {page_no}; refreshing session (attempt {attempt}/{self.max_retries})")
+                        session = self._thread_session(force_refresh=True)
+                        time.sleep(1.0 * attempt)
+                        continue
 
-                    resp_obj = data.get("response", {})
-                    raw_items = resp_obj.get("reviewData", []) or resp_obj.get("data", []) or data.get("reviews", [])
+                    resp_obj = data.get("response") if isinstance(data.get("response"), dict) else {}
+                    raw_items = resp_obj.get("reviewData") or resp_obj.get("data") or data.get("reviews") or []
 
+                    reviews = []
                     for item in raw_items:
-                        rev = Review(
-                            id=str(item.get("id", "")),
-                            child_id=str(item.get("childId", "")) if item.get("childId") else None,
-                            title=clean_text(item.get("title", "")),
-                            description=clean_text(item.get("description", "")),
-                            reviewer_name=clean_text(item.get("name", "Anonymous")),
-                            rating=int(item.get("rating", 5)),
-                            created_on=str(item.get("createdOn", "")),
-                            relative_date=str(item.get("reviewCreationTextV2") or item.get("reviewCreationText", "")),
-                            is_buyer=bool(item.get("isBuyer", False)),
-                            label=clean_text(item.get("label", "")),
-                            like_count=int(item.get("likeCount", 0)),
-                            images=item.get("images", []) or [],
-                            customer_profile_url=item.get("customerProfileUrl", ""),
-                            user_review_count=int(item.get("userReviewCount", 0)),
-                            user_image_count=int(item.get("userImageCount", 0)),
-                            pro_user=bool(item.get("proUser", False)),
-                            aspects=item.get("aspects", []) or [],
-                        )
-                        reviews.append(rev)
+                        if isinstance(item, dict):
+                            rev = self._parse_review(item)
+                            if rev:
+                                reviews.append(rev)
 
-                    # If empty list returned, partition has ended
-                    is_exhausted = len(reviews) == 0
-                    return reviews, total_count, is_exhausted
+                    return PageResult(
+                        status=PAGE_OK if reviews else PAGE_END,
+                        reviews=reviews,
+                        total_count=self._extract_total(data),
+                        page_no=page_no,
+                    )
 
-                elif resp.status_code == 400:
-                    # Nykaa's API returns 400 when pageNo exceeds maximum allowed page (e.g. page > 40)
-                    logger.debug(f"Reached API pagination ceiling at page {page_no} (Status 400)")
-                    return reviews, total_count, True
+                elif resp.status_code in (400, 404, 422):
+                    # Nykaa's API returns 400 when pageNo exceeds the maximum allowed page (e.g. page > 40)
+                    logger.debug(f"Reached API pagination ceiling at page {page_no} (Status {resp.status_code})")
+                    return PageResult(status=PAGE_END, page_no=page_no)
 
                 elif resp.status_code == 429:
-                    wait_time = 1.8 * attempt + random.uniform(0.5, 1.5)
-                    logger.warning(f"Rate limited (429) on page {page_no}. Retrying in {wait_time:.1f}s (Attempt {attempt}/{self.max_retries})...")
+                    wait_time = 2.0 * attempt + random.uniform(0.5, 1.5)
+                    logger.warning(f"Rate limited (429) on page {page_no}. Pausing {wait_time:.1f}s (attempt {attempt}/{self.max_retries})")
+                    self._set_cooldown(wait_time)
                     if attempt >= 3:
-                        # Refresh cookies/session if repeatedly hitting rate limits
-                        self._ensure_session(force_refresh=True)
-                    time.sleep(wait_time)
+                        session = self._thread_session(force_refresh=True)
+
+                elif resp.status_code == 403:
+                    # Akamai blocked this session's cookies/fingerprint: start a fresh one
+                    wait_time = 2.0 * attempt
+                    logger.warning(f"Blocked (403) on page {page_no}. New session in {wait_time:.1f}s (attempt {attempt}/{self.max_retries})")
+                    self._set_cooldown(wait_time)
+                    session = self._thread_session(force_refresh=True)
 
                 else:
-                    logger.warning(f"Reviews API returned HTTP {resp.status_code} for page {page_no}")
-                    time.sleep(1.5)
+                    logger.warning(f"Reviews API returned HTTP {resp.status_code} for page {page_no} (attempt {attempt}/{self.max_retries})")
+                    time.sleep(1.0 * attempt)
 
+            except ScrapeCancelled:
+                raise
             except Exception as e:
-                logger.warning(f"Request error on page {page_no} (Attempt {attempt}): {e}")
-                time.sleep(1.5)
+                logger.warning(f"Request error on page {page_no} (attempt {attempt}/{self.max_retries}): {e}")
+                time.sleep(1.0 * attempt)
 
-        return reviews, total_count, False
+        return PageResult(status=PAGE_ERROR, page_no=page_no)
+
+    # ------------------------------------------------------------------ #
+    # Crawling
+    # ------------------------------------------------------------------ #
+
+    def _build_partitions(self, sort: str, filter_by: Optional[str]) -> List[Tuple[Optional[str], str]]:
+        """Ordered list of (filter, sort) queries to crawl."""
+        sorts = [sort] + [s for s in ALL_SORTS if s != sort]
+        partitions: List[Tuple[Optional[str], str]] = []
+
+        def add(p):
+            if p not in partitions:
+                partitions.append(p)
+
+        if filter_by and filter_by != "ALL":
+            for s in sorts:
+                add((filter_by, s))
+            return partitions
+
+        # Unfiltered first: covers small products entirely in one pass
+        add((None, sort))
+        # Each star rating x every sort order: the main way past the per-query page ceiling
+        for star in STAR_FILTERS:
+            for s in sorts:
+                add((star, s))
+        # Extra angles that surface reviews the above can miss on very large products
+        for s in sorts:
+            add(("VERIFIED_BUYER", s))
+        for s in sorts:
+            add((None, s))
+        return partitions
 
     def scrape(
         self,
         target: str,
-        max_reviews: Optional[int] = 50,
+        max_reviews: Optional[int] = None,
         sort: str = "MOST_RECENT",
         filter_by: Optional[str] = None,
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> ScrapeResult:
         """
-        High-level scraping method with Multi-Partition Deep Scraping.
-        Overcomes Nykaa's 40-page API ceiling by partitioning across star ratings
-        and sort algorithms, deduplicating reviews by review ID.
+        Scrapes reviews for a product URL, product ID or search query.
+
+        max_reviews: stop after this many unique reviews (None = all).
+        progress_callback(collected, total_available, pages_fetched) is called as pages arrive.
+        cancel_event: set it from another thread to stop early; the reviews collected so far are returned.
         """
+        self._cancel_event = cancel_event
+        sort = sort if sort in ALL_SORTS else "MOST_RECENT"
+        if filter_by == "ALL":
+            filter_by = None
+        if max_reviews is not None and max_reviews <= 0:
+            max_reviews = None
+
         self._ensure_session()
 
-        # Step 1: Resolve Target to Product ID and Canonical URL
-        primary_id, canonical_url, alt_id = extract_product_id(target)
-
-        if not primary_id:
-            logger.info(f"Target '{target}' is not a direct URL/ID. Searching Nykaa...")
-            search_matches = self.search_products(target, limit=1)
-            if not search_matches:
-                raise ValueError(f"Could not find any product matching search term: '{target}'")
-            first_match = search_matches[0]
-            primary_id = first_match["id"]
-            canonical_url = first_match["url"]
-            logger.info(f"Resolved search to product: '{first_match['name']}' (ID: {primary_id})")
+        # Step 1: Resolve target to product ID and canonical URL
+        primary_id, canonical_url, alt_id = self.resolve_target(target)
 
         logger.info(f"Fetching product information for ID: {primary_id}...")
         product_info = self.get_product_info(primary_id, canonical_url)
 
-        # Step 2: Determine Scraping Strategy (Single Partition vs Deep Multi-Partition)
+        # Step 2: Pick the product ID that actually has reviews
+        first_sort = sort
+        probe = self.fetch_reviews_page(primary_id, 1, first_sort, filter_by, product_info.url)
         active_id = primary_id
+        if probe.status != PAGE_OK and alt_id and alt_id != primary_id:
+            logger.info(f"Primary ID {primary_id} returned no reviews. Trying alternate ID {alt_id}...")
+            alt_probe = self.fetch_reviews_page(alt_id, 1, first_sort, filter_by, product_info.url)
+            if alt_probe.status == PAGE_OK:
+                probe, active_id = alt_probe, alt_id
+                product_info.id = alt_id
+        if probe.status == PAGE_ERROR:
+            raise RuntimeError(
+                "Nykaa's reviews API could not be reached after several retries "
+                "(blocked or rate limited). Please wait a minute and try again."
+            )
+
+        # Total number of reviews Nykaa reports (for the requested filter)
+        total_available = probe.total_count
+        if not filter_by and total_available:
+            product_info.total_reviews_count = total_available
+        target_count = total_available or None
+        if max_reviews:
+            target_count = min(target_count, max_reviews) if target_count else max_reviews
+
         seen_ids: Set[str] = set()
         all_reviews: List[Review] = []
-        total_available = 0
+        star_counts_seen = {i: 0 for i in range(1, 6)}
+        star_totals: Dict[str, int] = {}
+        failed_pages: List[Tuple[Optional[str], str, int]] = []
+        pages_fetched = 0
+        lock = threading.Lock()
 
-        # Construct partition sequence
-        # If user explicitly asked for a specific star rating (e.g. STAR_5), partition through all sorts for that rating
-        # If user wants all ratings or large limit, partition through all star ratings and sorts
-        partitions: List[Tuple[Optional[str], str]] = []
-
-        if filter_by and filter_by != "ALL":
-            # Specific filter requested by user
-            for s in [sort, "MOST_HELPFUL", "MOST_RECENT", "POSITIVE_FIRST", "NEGATIVE_FIRST"]:
-                if (filter_by, s) not in partitions:
-                    partitions.append((filter_by, s))
-        else:
-            # Full deep crawl:
-            # When scraping all or high volumes, start with MOST_HELPFUL (yields 20 reviews per page!)
-            primary_sort = sort or "MOST_HELPFUL"
-            if max_reviews is None or max_reviews > 100:
-                partitions.append((None, "MOST_HELPFUL"))
-                if primary_sort != "MOST_HELPFUL":
-                    partitions.append((None, primary_sort))
-            else:
-                partitions.append((None, primary_sort))
-
-            if (None, "NEGATIVE_FIRST") not in partitions:
-                partitions.append((None, "NEGATIVE_FIRST"))
-            if (None, "MOST_RECENT") not in partitions:
-                partitions.append((None, "MOST_RECENT"))
-            # 4. Each individual star rating (enables accessing reviews beyond the 40-page ceiling)
-            for star in ["STAR_5", "STAR_4", "STAR_3", "STAR_2", "STAR_1"]:
-                partitions.append((star, "MOST_RECENT"))
-                partitions.append((star, "MOST_HELPFUL"))
-            # 5. Verified buyers & with images partitions
-            partitions.append(("VERIFIED_BUYER", "MOST_RECENT"))
-            partitions.append(("WITH_IMAGES", "MOST_RECENT"))
-
-        logger.info(f"Starting review scraping for '{product_info.name}' (Target limit: {max_reviews or 'All'})...")
-
-        for partition_idx, (p_filter, p_sort) in enumerate(partitions):
-            if max_reviews and len(all_reviews) >= max_reviews:
-                break
-
-            filter_name = p_filter or "ALL"
-            logger.info(f"--- Crawling Partition {partition_idx + 1}/{len(partitions)} (Filter: {filter_name}, Sort: {p_sort}) ---")
-
-            page_no = 1
-            consecutive_zero_pages = 0
-
-            while page_no <= 45:  # Nykaa caps pageNo at ~40
-                if max_reviews and len(all_reviews) >= max_reviews:
-                    break
-
-                reviews_page, total_count, is_exhausted = self.fetch_reviews_page(
-                    product_id=active_id,
-                    page_no=page_no,
-                    sort=p_sort,
-                    filter_by=p_filter,
-                    referer=product_info.url,
-                )
-
-                # Check alternate ID fallback on first page if primary ID returns nothing
-                if page_no == 1 and not reviews_page and alt_id and alt_id != primary_id:
-                    logger.info(f"Primary ID {primary_id} returned 0 reviews. Trying alternate ID {alt_id}...")
-                    reviews_page, total_count, is_exhausted = self.fetch_reviews_page(
-                        product_id=alt_id,
-                        page_no=page_no,
-                        sort=p_sort,
-                        filter_by=p_filter,
-                        referer=product_info.url,
-                    )
-                    if reviews_page:
-                        active_id = alt_id
-                        product_info.id = active_id
-
-                if total_count and not total_available:
-                    total_available = total_count
-                    product_info.total_reviews_count = total_count
-
-                if is_exhausted or not reviews_page:
-                    consecutive_zero_pages += 1
-                    if consecutive_zero_pages >= 2:
-                        break
-                    page_no += 1
-                    continue
-                else:
-                    consecutive_zero_pages = 0
-
-                # Deduplicate by unique review ID
-                new_added = 0
-                for rev in reviews_page:
+        def add_reviews(reviews: List[Review]) -> int:
+            added = 0
+            with lock:
+                for rev in reviews:
                     if rev.id not in seen_ids:
                         seen_ids.add(rev.id)
                         all_reviews.append(rev)
-                        new_added += 1
+                        if rev.rating in star_counts_seen:
+                            star_counts_seen[rev.rating] += 1
+                        added += 1
+            return added
 
-                logger.info(f"Page {page_no}: +{len(reviews_page)} fetched ({new_added} unique new). Total collected: {len(all_reviews)}/{total_available or '?'}")
+        def report():
+            if progress_callback:
+                try:
+                    progress_callback(len(all_reviews), total_available, pages_fetched)
+                except Exception:
+                    pass
 
-                if progress_callback:
-                    progress_callback(len(all_reviews), total_available, page_no)
+        def done() -> bool:
+            if max_reviews and len(all_reviews) >= max_reviews:
+                return True
+            return bool(target_count) and len(all_reviews) >= target_count
 
-                if max_reviews and len(all_reviews) >= max_reviews:
-                    all_reviews = all_reviews[:max_reviews]
+        partitions = self._build_partitions(sort, filter_by)
+        logger.info(
+            f"Starting review scraping for '{product_info.name}' "
+            f"(Nykaa reports {total_available or '?'} reviews, limit: {max_reviews or 'All'}, "
+            f"{len(partitions)} partitions, {self.workers} workers)..."
+        )
+
+        executor = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="nykaa")
+        try:
+            for partition_idx, (p_filter, p_sort) in enumerate(partitions):
+                if done():
                     break
+                self._check_cancelled()
 
-                page_no += 1
-                time.sleep(random.uniform(self.delay_range[0], self.delay_range[1]))
+                # Skip a star partition once every review of that star is already collected
+                if p_filter in star_totals:
+                    star_num = int(p_filter[-1])
+                    if star_totals[p_filter] and star_counts_seen[star_num] >= star_totals[p_filter]:
+                        continue
 
-        # Step 3: Compute Summary Statistics
+                filter_name = p_filter or "ALL"
+                logger.info(f"--- Partition {partition_idx + 1}/{len(partitions)} (Filter: {filter_name}, Sort: {p_sort}) ---")
+
+                # Page 1 is fetched alone to learn page size and the partition's review count
+                if partition_idx == 0 and (p_filter, p_sort) == (filter_by, first_sort):
+                    first = probe
+                else:
+                    first = self.fetch_reviews_page(active_id, 1, p_sort, p_filter, product_info.url)
+                pages_fetched += 1
+
+                if first.status == PAGE_ERROR:
+                    failed_pages.append((p_filter, p_sort, 1))
+                    continue
+                if first.status == PAGE_END:
+                    if p_filter in STAR_FILTERS:
+                        star_totals[p_filter] = 0
+                    continue
+
+                if p_filter in STAR_FILTERS and first.total_count:
+                    star_totals.setdefault(p_filter, first.total_count)
+
+                partition_ids: Set[str] = {r.id for r in first.reviews}
+                new_added = add_reviews(first.reviews)
+                page_size = len(first.reviews)
+                logger.info(f"Page 1: +{page_size} fetched ({new_added} new). Total: {len(all_reviews)}/{total_available or '?'}")
+                report()
+
+                # Estimate how many pages this partition has (if Nykaa tells us its count)
+                if first.total_count and page_size:
+                    est_pages = math.ceil(first.total_count / page_size)
+                    if first.total_count <= page_size:
+                        continue
+                else:
+                    est_pages = HARD_PAGE_CAP
+                last_page = min(est_pages, HARD_PAGE_CAP)
+
+                # Remaining pages: concurrent batches, stopping at the first exhausted page
+                next_page = 2
+                partition_ended = False
+                while next_page <= last_page and not partition_ended and not done():
+                    self._check_cancelled()
+                    batch = list(range(next_page, min(next_page + self.workers, last_page + 1)))
+                    next_page = batch[-1] + 1
+
+                    def fetch(pno, f=p_filter, s=p_sort):
+                        time.sleep(random.uniform(*self.delay_range))
+                        return self.fetch_reviews_page(active_id, pno, s, f, product_info.url)
+
+                    results = list(executor.map(fetch, batch))
+                    for res in sorted(results, key=lambda r: r.page_no):
+                        pages_fetched += 1
+                        if res.status == PAGE_ERROR:
+                            failed_pages.append((p_filter, p_sort, res.page_no))
+                            continue
+                        if res.status == PAGE_END:
+                            partition_ended = True
+                            break
+                        page_ids = {r.id for r in res.reviews}
+                        if page_ids <= partition_ids:
+                            # API is repeating pages it already served: ceiling reached
+                            partition_ended = True
+                            break
+                        partition_ids |= page_ids
+                        new_added = add_reviews(res.reviews)
+                        logger.info(f"Page {res.page_no}: +{len(res.reviews)} fetched ({new_added} new). Total: {len(all_reviews)}/{total_available or '?'}")
+                    report()
+
+            # Step 3: Recovery pass for pages that failed (network / rate limits)
+            if failed_pages and not done():
+                logger.info(f"Retrying {len(failed_pages)} failed page(s) after a short pause...")
+                time.sleep(5)
+                still_failed = 0
+                for p_filter, p_sort, pno in failed_pages:
+                    if done():
+                        break
+                    self._check_cancelled()
+                    res = self.fetch_reviews_page(active_id, pno, p_sort, p_filter, product_info.url)
+                    pages_fetched += 1
+                    if res.status == PAGE_OK:
+                        add_reviews(res.reviews)
+                        report()
+                    elif res.status == PAGE_ERROR:
+                        still_failed += 1
+                if still_failed:
+                    logger.warning(f"{still_failed} page(s) could not be fetched even after retrying.")
+
+        except ScrapeCancelled:
+            logger.warning("Scrape cancelled; returning the reviews collected so far.")
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._cancel_event = None
+
+        if max_reviews:
+            all_reviews = all_reviews[:max_reviews]
+
+        # Step 4: Compute summary statistics
         total_scraped = len(all_reviews)
         star_counts = {"5": 0, "4": 0, "3": 0, "2": 0, "1": 0}
         verified_count = 0
-        with_images_count = 0
         rating_sum = 0
 
         for r in all_reviews:
@@ -451,20 +715,19 @@ class NykaaScraper:
             rating_sum += r.rating
             if r.is_buyer:
                 verified_count += 1
-            if r.images:
-                with_images_count += 1
 
         avg_rating = round(rating_sum / total_scraped, 2) if total_scraped > 0 else 0.0
 
         summary = RatingSummary(
             total_scraped=total_scraped,
+            total_available=total_available,
             average_rating=avg_rating,
             star_distribution=star_counts,
             verified_buyer_count=verified_count,
-            with_images_count=with_images_count,
         )
 
-        logger.info(f"Scraping completed! Successfully extracted {total_scraped} unique reviews for '{product_info.name}'.")
+        coverage = f" ({total_scraped / total_available * 100:.1f}% of {total_available} reported)" if total_available else ""
+        logger.info(f"Scraping completed! Extracted {total_scraped} unique reviews for '{product_info.name}'{coverage}.")
 
         return ScrapeResult(
             product=product_info,

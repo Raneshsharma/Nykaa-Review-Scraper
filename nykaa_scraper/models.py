@@ -19,12 +19,9 @@ class Review:
     is_buyer: bool = False
     label: str = ""
     like_count: int = 0
-    images: List[str] = field(default_factory=list)
     customer_profile_url: str = ""
     user_review_count: int = 0
-    user_image_count: int = 0
     pro_user: bool = False
-    aspects: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -50,12 +47,12 @@ class ProductInfo:
 @dataclass
 class RatingSummary:
     total_scraped: int = 0
+    total_available: int = 0
     average_rating: float = 0.0
     star_distribution: Dict[str, int] = field(default_factory=lambda: {
         "5": 0, "4": 0, "3": 0, "2": 0, "1": 0
     })
     verified_buyer_count: int = 0
-    with_images_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

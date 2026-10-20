@@ -20,23 +20,30 @@ Nykaa protects its platform with **Akamai Bot Manager & Edge WAF**. Standard HTT
   - Reviewer Name & Verified Buyer status
   - Review Date & Relative Date (e.g., *"Today"*, *"5 days ago"*)
   - Helpful Upvotes Count
-  - Customer Uploaded Review Photos
   - Reviewer Total Reviews & Pro User status
 - **Analytics & Summary**:
   - Average rating calculation
   - Star distribution breakdown (5★, 4★, 3★, 2★, 1★)
   - Verified Buyer percentage
-  - Total reviews with photos
+  - Coverage: scraped reviews vs. the total Nykaa reports
 - **Multi-Format Export**:
   - **CSV**: Encoded in `utf-8-sig` for seamless opening in Microsoft Excel without garbled Unicode/emojis.
   - **Excel (.xlsx)**: Formatted workbook with styled Nykaa pink header fill, borders, and a dedicated **Product Summary** sheet.
   - **JSON**: Structured JSON dataset ready for NLP/LLM sentiment analysis.
 - **Sorting & Filtering**:
   - Sort: Most Recent, Most Useful, Highest Rated, Lowest Rated
-  - Filter: All, 5 Stars, 4 Stars, 3 Stars, 2 Stars, 1 Star, Verified Buyers, With Images
+  - Filter: All, 5 Stars, 4 Stars, 3 Stars, 2 Stars, 1 Star, Verified Buyers
 - **Modern Web Dashboard**:
   - Interactive web UI built with FastAPI and Vanilla CSS.
-  - Real-time live scraper progress, product preview card, star breakdown charts, searchable review cards, photo lightbox, and one-click export downloads.
+  - Real-time scraper progress (reviews collected / total), product preview card, star breakdown charts, searchable review cards, and one-click export downloads.
+
+### How "scrape everything" works
+
+Nykaa's reviews API only serves ~40 pages per query, so one sort order can't reach every review on a popular product. The scraper crawls many partitions (each star rating × each sort order, verified buyers × each sort order, ...) and de-duplicates by review ID, stopping as soon as it has as many unique reviews as Nykaa reports.
+
+- **Fast**: pages are downloaded in parallel (`--workers`, default 4), each worker with its own browser-impersonated session.
+- **No silent gaps**: pages that fail (rate limits, network errors, Akamai blocks) are retried with back-off and a fresh session, then retried again in a final recovery pass.
+- **Coverage is reported**: the CLI summary, Excel summary sheet and web dashboard show `scraped / total`. If a single star bucket holds more reviews than all sort orders together can reach through the page ceiling, a few percent may remain unreachable; the coverage figure makes that visible.
 
 ---
 
@@ -58,11 +65,14 @@ pip install -r requirements.txt
 
 #### Direct Scrape with URL or Product ID:
 ```bash
-# Scrape 50 reviews by product ID and export to CSV, Excel, and JSON:
-python main.py "27905374" --limit 50 --format all
+# Scrape ALL reviews (default) from a product URL and export to CSV, Excel, and JSON:
+python main.py "https://www.nykaa.com/plum-black-rice-niacinamide-txa-10percent-night-clarity-jelly-serum/p/27905374"
 
-# Scrape using full Nykaa product URL:
-python main.py "https://www.nykaa.com/plum-black-rice-niacinamide-txa-10percent-night-clarity-jelly-serum/p/27905374" --limit 100
+# Only the first 100 reviews, by product ID, CSV only, into a custom file:
+python main.py "27905374" --limit 100 --format csv --output exports/plum.csv
+
+# Fewer parallel downloads if you see many 429 rate-limit warnings:
+python main.py "27905374" --workers 2
 ```
 
 #### Scrape by Product Search Query:
@@ -101,9 +111,8 @@ Then open your browser to **`http://localhost:8000`**.
 
 Features available in the UI:
 - **Instant Product Search**: Type any brand or product name for live auto-suggestions.
-- **Live Scraper Progress**: Watch the scraper bypass WAF, fetch pages, and extract data.
+- **Live Scraper Progress**: Real progress bar (reviews collected vs. Nykaa's total) and a Stop button that keeps the reviews collected so far. Scrapes run in the background, so large products don't time out.
 - **Interactive Review Browser**: Live search and filter within scraped reviews.
-- **Customer Photo Lightbox**: Click any customer review thumbnail to zoom.
 - **One-Click Downloads**: Direct download buttons for CSV, Excel (.xlsx), and JSON.
 
 ---
@@ -122,9 +131,10 @@ scraper = NykaaScraper()
 # Scrape reviews for any product
 result = scraper.scrape(
     target="https://www.nykaa.com/plum-black-rice-niacinamide-txa-10percent-night-clarity-jelly-serum/p/27905374",
-    max_reviews=50,
+    max_reviews=None,  # None = all reviews
     sort="MOST_RECENT"
 )
+print(f"Scraped {result.summary.total_scraped} of {result.summary.total_available} reviews")
 
 # Product metadata
 print("Product:", result.product.name)
@@ -177,6 +187,8 @@ Nykaa Scrapper/
 | Parameter | Options | Description |
 |---|---|---|
 | `sort` | `MOST_RECENT`, `MOST_HELPFUL`, `POSITIVE_FIRST`, `NEGATIVE_FIRST` | Review ordering |
-| `filter_by` | `ALL`, `STAR_5`, `STAR_4`, `STAR_3`, `STAR_2`, `STAR_1`, `VERIFIED_BUYER`, `WITH_IMAGES` | Filter criteria |
-| `max_reviews` | Integer or `None` (0 for all) | Review count ceiling |
+| `filter_by` | `ALL`, `STAR_5`, `STAR_4`, `STAR_3`, `STAR_2`, `STAR_1`, `VERIFIED_BUYER` | Filter criteria |
+| `max_reviews` / `--limit` | Integer, or `None` / `0` for all (default) | Review count ceiling |
+| `workers` / `--workers` | Integer (default 4) | Parallel page downloads |
 | `format` | `csv`, `excel`, `json`, `all` | Export file types |
+| `--output` | Directory or file path | Where exports are written (default `output/`) |

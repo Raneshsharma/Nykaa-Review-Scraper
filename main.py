@@ -42,10 +42,11 @@ def print_summary(result):
         print(f"Price:           ₹{result.product.price}")
     print(f"Product URL:     {result.product.url}")
     print("-" * 60)
-    print(f"Total Scraped:   {result.summary.total_scraped} reviews")
+    total = result.summary.total_available
+    coverage = f" of {total} on Nykaa ({result.summary.total_scraped / total * 100:.1f}%)" if total else ""
+    print(f"Total Scraped:   {result.summary.total_scraped} reviews{coverage}")
     print(f"Average Rating:  ★ {result.summary.average_rating} / 5.0")
     print(f"Verified Buyers: {result.summary.verified_buyer_count} ({round(result.summary.verified_buyer_count / max(result.summary.total_scraped, 1) * 100, 1)}%)")
-    print(f"With Images:     {result.summary.with_images_count}")
     print("-" * 60)
     print("Star Rating Breakdown:")
     for star in ["5", "4", "3", "2", "1"]:
@@ -54,6 +55,33 @@ def print_summary(result):
         bar = "█" * (pct // 4)
         print(f"  {star} Star | {bar:<25} | {count:>4} ({pct:>2}%)")
     print("=" * 60)
+
+
+def export_result(result, export_fmt, output=None):
+    """
+    Writes the result in the chosen format(s). `output` may be a directory or a file path
+    (its extension is replaced per format); defaults to ./output/nykaa_reviews_<id>_<timestamp>.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    default_name = f"nykaa_reviews_{result.product.id}_{timestamp}"
+    if output:
+        out = Path(output)
+        if out.suffix:
+            out_dir, base_name = out.parent, out.stem
+        else:
+            out_dir, base_name = out, default_name
+    else:
+        out_dir, base_name = Path("output"), default_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    exported_paths = []
+    if export_fmt in ("csv", "all"):
+        exported_paths.append(export_to_csv(result, str(out_dir / f"{base_name}.csv")))
+    if export_fmt in ("excel", "all"):
+        exported_paths.append(export_to_excel(result, str(out_dir / f"{base_name}.xlsx")))
+    if export_fmt in ("json", "all"):
+        exported_paths.append(export_to_json(result, str(out_dir / f"{base_name}.json")))
+    return exported_paths
 
 
 def run_interactive():
@@ -65,12 +93,10 @@ def run_interactive():
         print("Error: Target cannot be empty. Exiting.")
         return
 
-    limit_input = input("How many reviews to scrape? (default 50, enter 0 for all): ").strip()
-    limit = 50
-    if limit_input.isdigit():
+    limit_input = input("How many reviews to scrape? (press Enter for all): ").strip()
+    limit = None
+    if limit_input.isdigit() and int(limit_input) > 0:
         limit = int(limit_input)
-        if limit == 0:
-            limit = None
 
     print("\nSort options:")
     print("  1) Most Recent (default)")
@@ -86,13 +112,13 @@ def run_interactive():
     print("  2) 5 Stars Only")
     print("  3) 4 Stars Only")
     print("  4) 3 Stars Only")
-    print("  5) 1 Star Only")
-    print("  6) Verified Buyers Only")
-    print("  7) With Images Only")
+    print("  5) 2 Stars Only")
+    print("  6) 1 Star Only")
+    print("  7) Verified Buyers Only")
     filter_choice = input("Select filter [1-7]: ").strip()
     filter_map = {
         "1": "ALL", "2": "STAR_5", "3": "STAR_4", "4": "STAR_3",
-        "5": "STAR_1", "6": "VERIFIED_BUYER", "7": "WITH_IMAGES"
+        "5": "STAR_2", "6": "STAR_1", "7": "VERIFIED_BUYER"
     }
     filter_by = filter_map.get(filter_choice, "ALL")
 
@@ -108,9 +134,9 @@ def run_interactive():
     scraper = NykaaScraper()
     print("\nFetching reviews, please wait...\n")
 
-    def progress(scraped, total, page):
+    def progress(scraped, total, pages):
         tot_str = str(total) if total else "?"
-        print(f"\r-> Scraped {scraped} reviews (Page {page}, Total Available: {tot_str})", end="", flush=True)
+        print(f"\r-> Scraped {scraped}/{tot_str} reviews ({pages} pages fetched)", end="", flush=True)
 
     try:
         result = scraper.scrape(
@@ -123,26 +149,10 @@ def run_interactive():
         print()
         print_summary(result)
 
-        # Export files
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = Path("output")
-        out_dir.mkdir(exist_ok=True)
-        base_name = f"nykaa_reviews_{result.product.id}_{timestamp}"
-
-        exported_paths = []
-        if export_fmt in ("csv", "all"):
-            path = export_to_csv(result, str(out_dir / f"{base_name}.csv"))
-            exported_paths.append(path)
-        if export_fmt in ("excel", "all"):
-            path = export_to_excel(result, str(out_dir / f"{base_name}.xlsx"))
-            exported_paths.append(path)
-        if export_fmt in ("json", "all"):
-            path = export_to_json(result, str(out_dir / f"{base_name}.json"))
-            exported_paths.append(path)
-
+        exported_paths = export_result(result, export_fmt)
         print("\nExported Files:")
         for p in exported_paths:
-            print(f" -> {p}")
+            print(f" -> {Path(p).resolve()}")
 
     except Exception as e:
         print(f"\n[Error] {e}")
@@ -166,8 +176,8 @@ def main():
     parser.add_argument(
         "--limit", "-l",
         type=int,
-        default=50,
-        help="Maximum reviews to scrape (default: 50. Use 0 for all).",
+        default=0,
+        help="Maximum reviews to scrape (default: 0 = all reviews).",
     )
     parser.add_argument(
         "--sort",
@@ -177,7 +187,7 @@ def main():
     )
     parser.add_argument(
         "--filter",
-        choices=["ALL", "STAR_5", "STAR_4", "STAR_3", "STAR_2", "STAR_1", "VERIFIED_BUYER", "WITH_IMAGES"],
+        choices=["ALL", "STAR_5", "STAR_4", "STAR_3", "STAR_2", "STAR_1", "VERIFIED_BUYER"],
         default="ALL",
         help="Filter reviews by star rating or condition.",
     )
@@ -192,6 +202,12 @@ def main():
         type=str,
         default=None,
         help="Custom output file path or directory.",
+    )
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=4,
+        help="Parallel page downloads (default: 4). Lower it if you see many 429 rate-limit warnings.",
     )
     parser.add_argument(
         "--ui",
@@ -214,12 +230,12 @@ def main():
         return
 
     print_banner()
-    scraper = NykaaScraper()
-    limit = None if args.limit == 0 else args.limit
+    scraper = NykaaScraper(workers=args.workers)
+    limit = None if args.limit <= 0 else args.limit
 
-    def progress(scraped, total, page):
+    def progress(scraped, total, pages):
         tot_str = str(total) if total else "?"
-        print(f"\r-> Scraped {scraped} reviews (Page {page}, Total Available: {tot_str})", end="", flush=True)
+        print(f"\r-> Scraped {scraped}/{tot_str} reviews ({pages} pages fetched)", end="", flush=True)
 
     try:
         result = scraper.scrape(
@@ -232,23 +248,7 @@ def main():
         print()
         print_summary(result)
 
-        # Handle outputs
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = Path("output")
-        out_dir.mkdir(exist_ok=True)
-        base_name = f"nykaa_reviews_{result.product.id}_{timestamp}"
-
-        exported_paths = []
-        if args.format in ("csv", "all"):
-            path = export_to_csv(result, str(out_dir / f"{base_name}.csv"))
-            exported_paths.append(path)
-        if args.format in ("excel", "all"):
-            path = export_to_excel(result, str(out_dir / f"{base_name}.xlsx"))
-            exported_paths.append(path)
-        if args.format in ("json", "all"):
-            path = export_to_json(result, str(out_dir / f"{base_name}.json"))
-            exported_paths.append(path)
-
+        exported_paths = export_result(result, args.format, args.output)
         print("\nSaved files:")
         for p in exported_paths:
             print(f" -> {Path(p).resolve()}")
