@@ -71,13 +71,95 @@ class PageResult:
     reviews: List[Review] = field(default_factory=list)
     total_count: int = 0
     page_no: int = 0
+    # Reviewer-profile filters the API offers for this product, e.g. {"skinTone": ["801", ...]}
+    attributes: Dict[str, List[str]] = field(default_factory=dict)
+
+
+@dataclass
+class ScrapeProgress:
+    """A snapshot of a running scrape, for progress displays."""
+    collected: int = 0             # unique reviews collected so far
+    total: int = 0                 # reviews Nykaa reports (or the limit, if one was set)
+    pages_done: int = 0
+    pages_estimated: int = 0       # best current guess of the pages the whole scrape needs
+    elapsed_seconds: float = 0.0
+    eta_seconds: Optional[float] = None  # None while there isn't enough data to estimate
+    stage: str = ""                # what the scraper is doing right now
+    throttled: bool = False        # Nykaa is rate limiting and the scraper has slowed down
+    finished: bool = False
+
+
+class _Throttle:
+    """
+    Adaptive cap on concurrent requests. Nykaa rate-limits roughly 10% of requests at any
+    speed, so single 429s are ignored; the cap drops by 30% only when the share of 429s among
+    the last 40 responses rises well above that, and creeps back up once it falls again.
+    Keeps the scraper just under Nykaa's limit instead of retrying into it.
+    """
+
+    WINDOW = 40
+    HIGH = 0.25  # back off above this share of 429s
+    LOW = 0.12   # speed back up below this share
+
+    def __init__(self, maximum: int):
+        self.maximum = maximum
+        self.limit = float(maximum)
+        self.in_flight = 0
+        self.outcomes: List[bool] = []  # True = rate limited
+        self.since_change = 0
+        self.cond = threading.Condition()
+
+    def acquire(self):
+        with self.cond:
+            while self.in_flight >= max(1, int(self.limit)):
+                self.cond.wait(0.5)
+            self.in_flight += 1
+
+    def release(self):
+        with self.cond:
+            self.in_flight -= 1
+            self.cond.notify()
+
+    def _record(self, limited: bool):
+        self.outcomes.append(limited)
+        if len(self.outcomes) > self.WINDOW:
+            self.outcomes.pop(0)
+        self.since_change += 1
+
+    def _share(self) -> float:
+        return sum(self.outcomes) / len(self.outcomes) if len(self.outcomes) >= 10 else 0.0
+
+    def rate_limited(self):
+        with self.cond:
+            self._record(True)
+            # Wait for fresh evidence after each change before cutting again
+            if self._share() > self.HIGH and self.since_change >= 10:
+                self.limit = max(2.0, self.limit * 0.7)
+                self.since_change = 0
+
+    def success(self):
+        with self.cond:
+            self._record(False)
+            if self.limit < self.maximum and self._share() < self.LOW and self.since_change >= 15:
+                self.limit = min(float(self.maximum), self.limit + 1)
+                self.since_change = 0
+                self.cond.notify_all()
+
+    @property
+    def throttled(self) -> bool:
+        return self.limit < self.maximum * 0.75
 
 
 @dataclass(frozen=True)
 class Bucket:
-    """A slice of a product's reviews: optionally one variant and/or one star rating."""
+    """
+    A slice of a product's reviews: optionally one variant, one star rating, and one
+    reviewer-profile trait (e.g. ("skinTone", "801")). Trait slices only cover reviewers who
+    filled in that trait, so they are extra windows into a group rather than a partition.
+    """
     child: Optional[str] = None
     star: Optional[int] = None
+    attr: Optional[Tuple[str, str]] = None
 
     def params(self) -> Dict[str, str]:
         p: Dict[str, str] = {}
@@ -85,6 +167,8 @@ class Bucket:
             p["filters"] = f"STAR_{self.star}"
         if self.child:
             p["childIds"] = self.child
+        if self.attr:
+            p[self.attr[0]] = self.attr[1]
         return p
 
     def matches(self, review: Review) -> bool:
@@ -98,6 +182,8 @@ class Bucket:
             parts.append(f"variant {self.child}")
         if self.star:
             parts.append(f"{self.star}★")
+        if self.attr:
+            parts.append(f"{self.attr[0]} {self.attr[1]}")
         return " / ".join(parts) or "all reviews"
 
 
@@ -129,7 +215,7 @@ class NykaaScraper:
     def __init__(
         self,
         impersonate: Optional[str] = None,
-        timeout: int = 20,
+        timeout: int = 12,
         delay_range: Tuple[float, float] = (0.0, 0.15),
         max_retries: int = 6,
         workers: int = 12,
@@ -155,6 +241,15 @@ class NykaaScraper:
         self._cooldown_until = 0.0
 
         self._cancel_event: Optional[threading.Event] = None
+
+        self._throttle = _Throttle(self.workers)
+        self._progress = ScrapeProgress()
+        self._progress_lock = threading.Lock()
+        self._started_at: Optional[float] = None
+        self._rate_window: List[Tuple[float, int]] = []  # (time, pages_done) samples for the ETA
+        self._eta_smoothed: Tuple[Optional[float], float] = (None, 0.0)
+        # Request outcome counts, for diagnostics
+        self.stats: Dict[str, int] = {"requests": 0, "ok": 0, "rate_limited": 0, "blocked": 0, "errors": 0, "gave_up": 0}
 
     # ------------------------------------------------------------------ #
     # Session handling
@@ -472,6 +567,25 @@ class NykaaScraper:
         )
 
     @staticmethod
+    def _extract_attributes(data: Dict[str, Any]) -> Dict[str, List[str]]:
+        """Reviewer-profile filters offered for this product: {"skinTone": ["801", ...], ...}."""
+        out: Dict[str, List[str]] = {}
+        options = ((data.get("filter") or {}).get("portfolioOptions")) or []
+        for opt in options if isinstance(options, list) else []:
+            if not isinstance(opt, dict) or not opt.get("attribute"):
+                continue
+            values = []
+            for o in opt.get("options") or []:
+                if not isinstance(o, dict):
+                    continue
+                for v in o.get("valueOptions") or [o]:
+                    if isinstance(v, dict) and v.get("id"):
+                        values.append(str(v["id"]))
+            if values:
+                out[str(opt["attribute"])] = values
+        return out
+
+    @staticmethod
     def _extract_total(data: Dict[str, Any]) -> int:
         resp_obj = data.get("response") if isinstance(data.get("response"), dict) else {}
         for container in (data, resp_obj):
@@ -489,9 +603,11 @@ class NykaaScraper:
         filter_by: Optional[str] = None,
         referer: Optional[str] = None,
         child_id: Optional[str] = None,
+        extra_params: Optional[Dict[str, str]] = None,
     ) -> PageResult:
         """
         Fetches a single page of reviews from Nykaa's reviews API (thread-safe).
+        extra_params: further query params, e.g. {"skinTone": "801"}.
         """
         api_url = self.GATEWAY_REVIEWS_URL.format(product_id=product_id)
 
@@ -504,6 +620,8 @@ class NykaaScraper:
             params["filters"] = filter_by
         if child_id:
             params["childIds"] = child_id
+        if extra_params:
+            params.update(extra_params)
 
         headers = {
             "Accept": "application/json, text/plain, */*",
@@ -516,8 +634,21 @@ class NykaaScraper:
 
         for attempt in range(1, self.max_retries + 1):
             self._wait_for_cooldown()
+            self._throttle.acquire()
             try:
+                self.stats["requests"] += 1
                 resp = session.get(api_url, params=params, headers=headers, timeout=self.timeout)
+            except ScrapeCancelled:
+                raise
+            except Exception as e:
+                self.stats["errors"] += 1
+                logger.debug(f"Request error on page {page_no} (attempt {attempt}/{self.max_retries}): {e}")
+                time.sleep(0.8 * attempt)
+                continue
+            finally:
+                self._throttle.release()
+
+            try:
 
                 if resp.status_code == 200:
                     try:
@@ -539,11 +670,14 @@ class NykaaScraper:
                             if rev:
                                 reviews.append(rev)
 
+                    self.stats["ok"] += 1
+                    self._throttle.success()
                     return PageResult(
                         status=PAGE_OK,
                         reviews=reviews,
                         total_count=self._extract_total(data),
                         page_no=page_no,
+                        attributes=self._extract_attributes(data) if page_no == 1 else {},
                     )
 
                 elif resp.status_code == 400:
@@ -552,7 +686,9 @@ class NykaaScraper:
                     return PageResult(status=PAGE_END, page_no=page_no)
 
                 elif resp.status_code == 429:
-                    # Nykaa rate-limits a random ~10% of requests; a short pause on this request is enough
+                    # Nykaa rate-limits some requests: slow everyone down a little and retry this one
+                    self.stats["rate_limited"] += 1
+                    self._throttle.rate_limited()
                     wait_time = 0.7 * attempt + random.uniform(0.2, 0.8)
                     logger.debug(f"Rate limited (429) on page {page_no}; retrying in {wait_time:.1f}s (attempt {attempt}/{self.max_retries})")
                     if attempt >= 4:
@@ -562,20 +698,25 @@ class NykaaScraper:
 
                 elif resp.status_code == 403:
                     # Akamai blocked this session's cookies/fingerprint: start a fresh one
+                    self.stats["blocked"] += 1
+                    self._throttle.rate_limited()
                     logger.warning(f"Blocked (403) on page {page_no}; new session (attempt {attempt}/{self.max_retries})")
                     time.sleep(1.0 * attempt)
                     session = self._thread_session(force_refresh=True)
 
                 else:
+                    self.stats["errors"] += 1
                     logger.debug(f"Reviews API returned HTTP {resp.status_code} for page {page_no} (attempt {attempt}/{self.max_retries})")
                     time.sleep(0.8 * attempt)
 
             except ScrapeCancelled:
                 raise
             except Exception as e:
-                logger.debug(f"Request error on page {page_no} (attempt {attempt}/{self.max_retries}): {e}")
+                self.stats["errors"] += 1
+                logger.debug(f"Bad response on page {page_no} (attempt {attempt}/{self.max_retries}): {e}")
                 time.sleep(0.8 * attempt)
 
+        self.stats["gave_up"] += 1
         logger.warning(f"Giving up on page {page_no} after {self.max_retries} attempts.")
         return PageResult(status=PAGE_ERROR, page_no=page_no)
 
@@ -616,10 +757,53 @@ class NykaaScraper:
         Raises ScrapeCancelled if cancelled before the crawl itself started.
         """
         self._cancel_event = cancel_event
+        self._started_at = time.time()
+        self._rate_window = []
+        self._eta_smoothed = (None, 0.0)
+        self._throttle = _Throttle(self.workers)
+        self.stats = {k: 0 for k in self.stats}
+        with self._progress_lock:
+            self._progress = ScrapeProgress(stage="Connecting to Nykaa")
         try:
             return self._scrape(target, max_reviews, sort, filter_by, progress_callback)
         finally:
             self._cancel_event = None
+            with self._progress_lock:
+                self._progress.finished = True
+                self._progress.eta_seconds = 0
+
+    def progress(self) -> ScrapeProgress:
+        """
+        A live snapshot of the running scrape (safe to call from another thread, e.g. once a
+        second from a UI): reviews so far, elapsed time, estimated time left, current stage.
+        """
+        with self._progress_lock:
+            p = ScrapeProgress(**self._progress.__dict__)
+            window = list(self._rate_window)
+        now = time.time()
+        p.elapsed_seconds = now - self._started_at if self._started_at else 0.0
+        p.throttled = self._throttle.throttled
+        if not p.finished and p.pages_done >= 8 and len(window) >= 2:
+            (t0, n0), (t1, n1) = window[0], window[-1]
+            if t1 - t0 < 5:  # too short a window: use the average since the start
+                t0, n0 = self._started_at or t0, 0
+            rate = (n1 - n0) / max(now - t0, 1e-6)
+            if rate > 0:
+                raw = max(0.0, (p.pages_estimated - p.pages_done) / rate)
+                with self._progress_lock:
+                    prev, prev_at = self._eta_smoothed
+                    if prev is None:
+                        smoothed = raw
+                    else:
+                        # Count the previous estimate down by the time passed, then move a third of
+                        # the way toward the new one: the display stays steady as the plan grows
+                        prev = max(0.0, prev - (now - prev_at))
+                        smoothed = prev + (raw - prev) / 3
+                    self._eta_smoothed = (smoothed, now)
+                p.eta_seconds = smoothed
+        if p.throttled and not p.finished:
+            p.stage = (p.stage + " · " if p.stage else "") + "Nykaa is rate-limiting, slowed down"
+        return p
 
     def _scrape(self, target, max_reviews, sort, filter_by, progress_callback) -> ScrapeResult:
         sort = sort if sort in ALL_SORTS else "MOST_RECENT"
@@ -639,6 +823,8 @@ class NykaaScraper:
             )
 
         # Step 1: Resolve target to product ID and canonical URL
+        with self._progress_lock:
+            self._progress.stage = "Finding the product"
         primary_id, canonical_url, alt_id = self.resolve_target(target)
 
         logger.info(f"Fetching product information for ID: {primary_id}...")
@@ -647,6 +833,8 @@ class NykaaScraper:
         root = Bucket(star=int(filter_by[-1]) if filter_by else None)
 
         # Step 2: Pick the product ID that actually has reviews
+        with self._progress_lock:
+            self._progress.stage = "Reading the first page of reviews"
         first_sort = sort if max_reviews else CRAWL_SORTS[0]
         probe = self.fetch_reviews_page(primary_id, 1, first_sort, filter_by, referer)
         active_id = primary_id
@@ -667,6 +855,7 @@ class NykaaScraper:
 
         # Total number of reviews Nykaa reports (for the requested filter)
         total_available = probe.total_count if probe.status == PAGE_OK else 0
+        product_attrs: Dict[str, List[str]] = probe.attributes
         if not filter_by and total_available:
             product_info.total_reviews_count = total_available
         target_count = total_available or None
@@ -708,18 +897,76 @@ class NykaaScraper:
                     return len(all_reviews)
                 return sum(1 for r in all_reviews if bucket.matches(r))
 
+        def set_stage(text: str) -> None:
+            with self._progress_lock:
+                self._progress.stage = text
+
         def bucket_done(bucket: Bucket) -> bool:
             if bucket in exhausted:
                 return True
+            if bucket.attr:
+                # Reviews don't say which traits their author set, so a trait slice's
+                # completeness can't be counted; it is done once fully read (exhausted)
+                return False
             count = bucket_counts.get(bucket)
             return count is not None and collected_in(bucket) >= count
 
+        def estimate_pages() -> int:
+            """
+            Best current guess of how many pages the whole scrape needs, from the group sizes
+            known so far. It grows as groups are discovered, so the time-left figure firms up.
+            """
+            R = ceiling["pages"]
+            reach = query_reach()
+
+            def pages(c: int) -> int:
+                return min(R, math.ceil(c / API_PAGE_SIZE))
+
+            def traits(c: int) -> int:
+                # Trait slices: roughly a third of reviewers fill each trait in
+                return sum(len(v) for v in product_attrs.values()) + 3 * math.ceil(min(c, 4000) * 0.3 / API_PAGE_SIZE) \
+                    if product_attrs else 0
+
+            def est(b: Bucket) -> int:
+                c = bucket_counts.get(b)
+                if c is None:
+                    return 1
+                if c <= reach:
+                    return pages(c)
+                if (b.child and b.star) or b.attr:
+                    return len(sorts_for(b)) * R + traits(c)
+                if b.star is None and b.child is None:
+                    stars = [Bucket(star=k) for k in (5, 4, 3, 2, 1)]
+                    if not any(x in bucket_counts for x in stars):
+                        return 2 * math.ceil(c / API_PAGE_SIZE)
+                    return sum(est(x) for x in stars)
+                kids = [Bucket(child=k, star=b.star) for k in list(known_children)]
+                known = [k for k in kids if k in bucket_counts]
+                rest = max(0, c - sum(bucket_counts[k] for k in known))
+                return len(sorts_for(b)) * R + sum(est(k) + 1 for k in known) + 2 * math.ceil(rest / API_PAGE_SIZE)
+
+            if max_reviews and max_reviews <= query_reach():
+                return math.ceil(max_reviews / API_PAGE_SIZE)
+            return est(root) + len(failed_pages)
+
         def report():
+            collected = len(all_reviews)
+            if max_reviews:
+                collected = min(collected, max_reviews)
+            with self._progress_lock:
+                self._progress.collected = collected
+                self._progress.total = target_count or total_available
+                self._progress.pages_done = pages_fetched
+                try:
+                    self._progress.pages_estimated = max(estimate_pages(), pages_fetched + 1)
+                except Exception:
+                    pass
+                now = time.time()
+                self._rate_window.append((now, pages_fetched))
+                while len(self._rate_window) > 2 and now - self._rate_window[0][0] > 30:
+                    self._rate_window.pop(0)
             if progress_callback:
                 try:
-                    collected = len(all_reviews)
-                    if max_reviews:
-                        collected = min(collected, max_reviews)
                     progress_callback(collected, target_count or total_available, pages_fetched)
                 except Exception:
                     pass
@@ -743,8 +990,10 @@ class NykaaScraper:
         def fetch(bucket: Bucket, p_sort: str, page_no: int) -> PageResult:
             if self.delay_range[1] > 0:
                 time.sleep(random.uniform(*self.delay_range))
+            params = bucket.params()
+            extra = {bucket.attr[0]: bucket.attr[1]} if bucket.attr else None
             return self.fetch_reviews_page(
-                active_id, page_no, p_sort, bucket.params().get("filters"), referer, bucket.params().get("childIds")
+                active_id, page_no, p_sort, params.get("filters"), referer, params.get("childIds"), extra
             )
 
         def handle_page(bucket: Bucket, p_sort: str, res: PageResult) -> None:
@@ -915,6 +1164,29 @@ class NykaaScraper:
                 return STAR_CRAWL_SORTS
             return CRAWL_SORTS
 
+        def crawl_trait_slices(bucket: Bucket) -> None:
+            """
+            Last resort for a group too big for any query to reach completely: read it once per
+            reviewer trait value (skin tone, skin type, hair type...). Each slice is small enough to
+            read in full, so every reviewer who filled in a trait is reached wherever they rank.
+            """
+            if not product_attrs or done() or bucket_done(bucket):
+                return
+            slices = [
+                Bucket(child=bucket.child, star=bucket.star, attr=(name, value))
+                for name, values in product_attrs.items() for value in values
+            ]
+            set_stage(f"Reading {bucket} by reviewer traits ({len(slices)} slices)")
+            prefetch_first_pages(slices, sorts_for(bucket)[0])
+            crawl_small_buckets([b for b in slices if 0 < bucket_counts.get(b, 0) <= query_reach()])
+            for b in slices:
+                if done() or bucket_done(bucket):
+                    return
+                if bucket_counts.get(b, 0) > query_reach():
+                    for s in sorts_for(b):
+                        crawl(b, s)
+                    exhausted.add(b)
+
         def crawl_all_sorts(bucket: Bucket, can_split: bool) -> None:
             """
             Crawls a bucket with one sort order after another until it is complete. A bucket that
@@ -936,6 +1208,12 @@ class NykaaScraper:
                     return
                 if i > 0:
                     extra_found += new
+            if count > query_reach() and not can_split:
+                before = collected_in(bucket)
+                crawl_trait_slices(bucket)
+                extra_found += collected_in(bucket) - before
+                if done() or bucket_done(bucket):
+                    return
             if count > query_reach() and extra_found:
                 # Other sort orders found reviews the first missed: the page limit cuts this bucket
                 # off, so a few reviews may sit outside every order's reach
@@ -954,6 +1232,7 @@ class NykaaScraper:
             if count == 0 or bucket_done(bucket):
                 return
             logger.info(f"{'  ' * depth}{bucket}: {count} reviews")
+            set_stage(f"Reading {bucket} ({count:,} reviews)")
 
             can_split = not (bucket.child and bucket.star)
             if count <= query_reach() or not can_split:
@@ -987,6 +1266,9 @@ class NykaaScraper:
                     complete(child_bucket, depth + 1)
                 if done() or bucket_done(bucket):
                     return
+            if not known_children:
+                # No variants to split by (single-variant product): use reviewer traits instead
+                crawl_trait_slices(bucket)
             exhausted.add(bucket)
 
         logger.info(
@@ -1009,6 +1291,7 @@ class NykaaScraper:
 
             # Recovery pass for pages that failed (network / rate limits)
             if failed_pages and not done():
+                set_stage(f"Retrying {len(failed_pages)} page(s) that failed")
                 logger.info(f"Retrying {len(failed_pages)} failed page(s) after a short pause...")
                 time.sleep(3)
                 retry_list, failed_pages[:] = list(failed_pages), []
@@ -1080,6 +1363,9 @@ class NykaaScraper:
         )
 
         coverage = f" ({total_scraped / total_available * 100:.1f}% of {total_available} reported)" if total_available else ""
+        with self._progress_lock:
+            self._progress.stage = "Done"
+            self._progress.collected = total_scraped
         logger.info(
             f"Scraping completed! Extracted {total_scraped} unique reviews for '{product_info.name}'{coverage} "
             f"using {pages_fetched} page requests."

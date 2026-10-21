@@ -120,6 +120,11 @@
             <div class="progress-bar-container">
                 <div id="progressBar" class="progress-bar-fill indeterminate"></div>
             </div>
+            <div class="progress-stats">
+                <div class="progress-stat"><span class="progress-stat-value" id="psCollected">0</span><span class="progress-stat-label">reviews so far</span></div>
+                <div class="progress-stat"><span class="progress-stat-value" id="psElapsed">0s</span><span class="progress-stat-label">elapsed</span></div>
+                <div class="progress-stat"><span class="progress-stat-value" id="psEta">…</span><span class="progress-stat-label">time left</span></div>
+            </div>
             <div class="live-ticker" id="liveTicker">Initializing requests...</div>
             <button type="button" id="stopScrapeBtn" class="btn btn-outline stop-btn">Stop &amp; keep reviews collected so far</button>
         </section>

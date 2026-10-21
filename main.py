@@ -5,7 +5,10 @@ Command-line interface to scrape reviews for any Nykaa product.
 """
 
 import sys
+import shutil
+import logging
 import argparse
+import threading
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +62,46 @@ def print_summary(result):
         print(f"WARNING: {result.summary.warning}")
 
 
+def format_duration(seconds) -> str:
+    seconds = int(round(seconds or 0))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def status_line(p) -> str:
+    total = f"{p.total:,}" if p.total else "?"
+    if p.eta_seconds is None:
+        eta = "estimating time left..."
+    else:
+        eta = f"~{format_duration(p.eta_seconds)} left"
+    line = f"[{format_duration(p.elapsed_seconds)}] {p.collected:,}/{total} reviews | {eta} | {p.stage}"
+    width = shutil.get_terminal_size((100, 20)).columns - 1
+    return line[:width].ljust(width)
+
+
+def scrape_with_status(scraper, **kwargs):
+    """Runs a scrape while a status line (reviews so far, elapsed, time left, stage) refreshes every second."""
+    stop = threading.Event()
+
+    def ticker():
+        while not stop.wait(1.0):
+            print("\r" + status_line(scraper.progress()), end="", flush=True)
+
+    t = threading.Thread(target=ticker, daemon=True)
+    t.start()
+    try:
+        return scraper.scrape(**kwargs)
+    finally:
+        stop.set()
+        t.join()
+        print("\r" + status_line(scraper.progress()), flush=True)
+
+
 def export_result(result, export_fmt, output=None):
     """
     Writes the result in the chosen format(s). `output` may be a directory or a file path
@@ -87,6 +130,7 @@ def export_result(result, export_fmt, output=None):
 
 
 def run_interactive():
+    logging.getLogger("NykaaScraper").setLevel(logging.WARNING)
     print_banner()
     print("Interactive Mode:")
     print("Enter a Nykaa Product URL, Product ID, or a product search term.")
@@ -136,19 +180,14 @@ def run_interactive():
     scraper = NykaaScraper()
     print("\nFetching reviews, please wait...\n")
 
-    def progress(scraped, total, pages):
-        tot_str = str(total) if total else "?"
-        print(f"\r-> Scraped {scraped}/{tot_str} reviews ({pages} pages fetched)", end="", flush=True)
-
     try:
-        result = scraper.scrape(
+        result = scrape_with_status(
+            scraper,
             target=target,
             max_reviews=limit,
             sort=sort,
             filter_by=filter_by if filter_by != "ALL" else None,
-            progress_callback=progress,
         )
-        print()
         print_summary(result)
 
         exported_paths = export_result(result, export_fmt)
@@ -212,6 +251,11 @@ def main():
         help="Parallel page downloads (default: 12). Lower it if you see many 429 rate-limit warnings.",
     )
     parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Show detailed scraper logs instead of the one-line status.",
+    )
+    parser.add_argument(
         "--diagnose",
         action="store_true",
         help="Probe how Nykaa's reviews API behaves for this product and save a report (for troubleshooting).",
@@ -223,6 +267,8 @@ def main():
     )
 
     args = parser.parse_args()
+    # Detailed logs would break the live status line; keep warnings only unless asked
+    logging.getLogger("NykaaScraper").setLevel(logging.INFO if args.verbose else logging.WARNING)
 
     if args.ui:
         from app import run_dashboard
@@ -250,19 +296,14 @@ def main():
     scraper = NykaaScraper(workers=args.workers)
     limit = None if args.limit <= 0 else args.limit
 
-    def progress(scraped, total, pages):
-        tot_str = str(total) if total else "?"
-        print(f"\r-> Scraped {scraped}/{tot_str} reviews ({pages} pages fetched)", end="", flush=True)
-
     try:
-        result = scraper.scrape(
+        result = scrape_with_status(
+            scraper,
             target=target,
             max_reviews=limit,
             sort=args.sort,
             filter_by=args.filter if args.filter != "ALL" else None,
-            progress_callback=progress,
         )
-        print()
         print_summary(result)
 
         exported_paths = export_result(result, args.format, args.output)

@@ -17,6 +17,8 @@ import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+SKIN_TONES = ["801", "802", "803", "804", "805", "806"]
+SKIN_TYPES = ["752", "753", "754"]
 KNOWN_FILTERS = {"STAR_1", "STAR_2", "STAR_3", "STAR_4", "STAR_5", "VERIFIED_BUYER", "WITH_IMAGES"}
 
 
@@ -29,6 +31,7 @@ class MockNykaa:
         star_weights=(0.62, 0.18, 0.09, 0.04, 0.07),  # 5..1 stars
         variants=("1001",),        # childIds reviews are spread over
         hidden_fraction=0.0,       # share of reviews that are counted but never served
+        trait_fraction=0.0,        # share of reviewers who filled in their skin tone / skin type
         fail_every=0,              # every Nth reviews request -> HTTP 500
         rate_limit_every=0,        # every Nth reviews request -> HTTP 429
         challenge_every=0,         # every Nth reviews request -> HTML page with status 200
@@ -46,6 +49,7 @@ class MockNykaa:
         for i in range(n_reviews):
             rating = rnd.choices([5, 4, 3, 2, 1], star_weights)[0]
             hidden = rnd.random() < hidden_fraction
+            has_traits = rnd.random() < trait_fraction
             self.reviews.append({
                 "id": 100000 + i,
                 # Malformed / odd fields the real API has been seen to send
@@ -60,7 +64,9 @@ class MockNykaa:
                 "_ts": i,
                 "_helpful": rnd.random(),
                 "_hidden": hidden,
+                "_traits": {"skinTone": rnd.choice(SKIN_TONES), "skinType": rnd.choice(SKIN_TYPES)} if has_traits else {},
             })
+        self.offer_traits = trait_fraction > 0
 
     @property
     def ids(self):
@@ -71,7 +77,7 @@ class MockNykaa:
         return int(float(r["rating"]))
 
     # -- request handling -------------------------------------------------
-    def _filtered(self, filters, child_ids):
+    def _filtered(self, filters, child_ids, traits=None):
         items = self.reviews
         for f in [x for x in (filters or "").split(",") if x]:
             if f not in KNOWN_FILTERS:
@@ -81,6 +87,9 @@ class MockNykaa:
         if child_ids:
             wanted = {int(c) for c in child_ids.split(",")}
             items = [x for x in items if x["childId"] in wanted]
+        for name, value in (traits or {}).items():
+            wanted = set(value.split(","))
+            items = [x for x in items if x["_traits"].get(name) in wanted]
         return items
 
     def handle(self, path, query):
@@ -102,7 +111,8 @@ class MockNykaa:
         if page > self.ceiling:
             return 400, "application/json", json.dumps({"error": "invalid page"})
         try:
-            items = self._filtered(query.get("filters"), query.get("childIds"))
+            traits = {k: query[k] for k in ("skinTone", "skinType") if k in query}
+            items = self._filtered(query.get("filters"), query.get("childIds"), traits)
         except ValueError as e:
             return 400, "application/json", json.dumps({"error": str(e)})
 
@@ -120,6 +130,11 @@ class MockNykaa:
         window = items[(page - 1) * self.page_size: page * self.page_size]
         chunk = [{k: v for k, v in r.items() if not k.startswith("_")} for r in window if not r["_hidden"]]
         body = {"reviewCount": len(items), "status": "success", "response": {"page": page, "reviewData": chunk}}
+        if self.offer_traits:
+            body["filter"] = {"options": [], "portfolioOptions": [
+                {"attribute": "skinTone", "options": [{"valueOptions": [{"id": v} for v in SKIN_TONES]}]},
+                {"attribute": "skinType", "options": [{"id": v} for v in SKIN_TYPES]},
+            ]}
         return 200, "application/json", json.dumps(body)
 
     # -- server -----------------------------------------------------------

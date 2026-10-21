@@ -49,6 +49,8 @@ Each bucket reports its own review count, so the scraper knows when a bucket is 
 
 - **Fast**: pages download in parallel (`--workers`, default 12), each worker with its own browser-impersonated session. Random `429` rate limits are retried on the spot.
 - **No silent gaps**: failed pages are retried with back-off and a fresh session, then again in a final recovery pass; if Nykaa keeps refusing, scraping stops early with a warning instead of hanging.
+- **Reviewer traits as a last resort**: a group still too big after every sort order (e.g. 4,500 five-star reviews of one shade) is also read slice by slice by reviewer skin tone / skin type / hair type, which the API offers per product. Each slice is small enough to read completely. On a 10,859-review hair serum this raised coverage from 5,581 to 7,139 reviews.
+- **Never looks frozen**: the terminal and the dashboard show reviews collected so far, elapsed time, estimated time left and what the scraper is doing right now, refreshed every second. When Nykaa starts rate-limiting hard, the scraper automatically slows down (and says so) instead of retrying into the limit, then speeds back up.
 - **Honest coverage**: Nykaa only serves verified-buyer reviews, and its review count includes reviews it never shows (about 10% on the products tested; the website can't show them either). The summary shows `scraped / reported` and explains the gap.
 
 Measured on the live site (October 2026, 12 workers):

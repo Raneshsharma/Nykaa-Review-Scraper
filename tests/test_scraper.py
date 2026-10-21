@@ -184,3 +184,56 @@ def test_text_helpers():
     assert safe_int("4.0") == 4
     assert safe_int(None) == 0
     assert safe_int("x", 3) == 3
+
+
+def test_trait_slices_reach_reviews_beyond_the_page_limit(mock_api):
+    # One variant, 5-star group of ~510 with a 100-review reach per query. Every reviewer filled
+    # in their skin tone/type, so the trait slices (each small) can reach the whole group.
+    kwargs = dict(n_reviews=600, ceiling=5, star_weights=(0.85, 0.1, 0.05, 0, 0))
+    mock_api(**kwargs)
+    without = fast_scraper().scrape(URL)
+    mock = mock_api(trait_fraction=1.0, **kwargs)
+    with_traits = fast_scraper().scrape(URL)
+    assert len(with_traits.reviews) > len(without.reviews)
+    assert {r.id for r in with_traits.reviews} == mock.ids
+
+
+def test_progress_snapshot_and_eta(mock_api):
+    mock_api(n_reviews=1500, ceiling=5, star_weights=(0.2, 0.2, 0.2, 0.2, 0.2),
+             variants=[str(5000 + i) for i in range(4)])
+    scraper = fast_scraper(workers=2)
+    snaps = []
+    stop = threading.Event()
+
+    def watch():
+        while not stop.wait(0.1):
+            snaps.append(scraper.progress())
+
+    t = threading.Thread(target=watch)
+    t.start()
+    result = scraper.scrape(URL)
+    stop.set()
+    t.join()
+    final = scraper.progress()
+    assert final.finished and final.collected == len(result.reviews) and final.stage == "Done"
+    assert any(s.eta_seconds is not None for s in snaps), "no time-left estimate was ever produced"
+    assert any(s.stage.startswith("Reading") for s in snaps)
+    elapsed = [s.elapsed_seconds for s in snaps]
+    assert elapsed == sorted(elapsed)
+    assert all(s.pages_estimated >= s.pages_done for s in snaps)
+
+
+def test_throttle_ignores_background_429s_but_backs_off_on_surges():
+    import random
+    from nykaa_scraper.scraper import _Throttle
+    rnd = random.Random(0)
+    t = _Throttle(12)
+    for _ in range(400):
+        t.rate_limited() if rnd.random() < 0.10 else t.success()
+    assert t.limit == 12 and not t.throttled
+    for _ in range(100):
+        t.rate_limited() if rnd.random() < 0.5 else t.success()
+    assert t.throttled
+    for _ in range(600):
+        t.rate_limited() if rnd.random() < 0.05 else t.success()
+    assert t.limit == 12

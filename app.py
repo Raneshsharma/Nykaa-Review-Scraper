@@ -83,7 +83,9 @@ def _run_job(job_id: str, target: str, limit: Optional[int], sort: str, filter_v
 
     try:
         # A fresh scraper per job: sessions and cooldown state are not shared between scrapes
-        result = NykaaScraper().scrape(
+        scraper = NykaaScraper()
+        job["scraper"] = scraper
+        result = scraper.scrape(
             target=target,
             max_reviews=limit,
             sort=sort,
@@ -134,7 +136,7 @@ def scrape_reviews(payload: ScrapeRequest):
     job_id = uuid.uuid4().hex[:8]
     jobs[job_id] = {
         "status": "running", "collected": 0, "total": 0, "pages": 0,
-        "result_id": None, "error": None, "cancel": threading.Event(),
+        "result_id": None, "error": None, "cancel": threading.Event(), "scraper": None,
     }
     threading.Thread(
         target=_run_job, args=(job_id, target, limit, sort_order, filter_val), daemon=True
@@ -148,7 +150,11 @@ def job_status(job_id: str):
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found.")
-    body = {k: v for k, v in job.items() if k != "cancel"}
+    body = {k: v for k, v in job.items() if k not in ("cancel", "scraper")}
+    scraper = job.get("scraper")
+    if scraper is not None:
+        # Live snapshot: reviews so far, elapsed seconds, estimated seconds left, current stage
+        body["progress"] = scraper.progress().__dict__
     if job["status"] == "done":
         if job["result_id"] in scrape_cache:
             body["data"] = scrape_cache[job["result_id"]].to_dict()

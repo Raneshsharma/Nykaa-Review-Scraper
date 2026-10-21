@@ -18,6 +18,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const liveTicker = document.getElementById("liveTicker");
     const progressBar = document.getElementById("progressBar");
     const stopScrapeBtn = document.getElementById("stopScrapeBtn");
+    const psCollected = document.getElementById("psCollected");
+    const psElapsed = document.getElementById("psElapsed");
+    const psEta = document.getElementById("psEta");
 
     const resultsSection = document.getElementById("resultsSection");
     const productImage = document.getElementById("productImage");
@@ -195,7 +198,7 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             if (job.status === "running") {
-                updateProgress(job.collected, job.total, job.pages);
+                updateProgress(job.progress || {collected: job.collected, total: job.total});
                 continue;
             }
 
@@ -225,16 +228,34 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 
-    function updateProgress(collected, total, pages) {
-        if (total > 0) {
-            const pct = Math.min(100, Math.round((collected / total) * 100));
+    function formatDuration(seconds) {
+        const s = Math.max(0, Math.round(seconds || 0));
+        if (s < 60) return `${s}s`;
+        const m = Math.floor(s / 60);
+        if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+        return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+    }
+
+    function updateProgress(p) {
+        const collected = p.collected || 0;
+        const total = p.total || 0;
+        psCollected.textContent = total > 0
+            ? `${collected.toLocaleString()} / ${total.toLocaleString()}`
+            : collected.toLocaleString();
+        psElapsed.textContent = formatDuration(p.elapsed_seconds);
+        psEta.textContent = (p.eta_seconds === null || p.eta_seconds === undefined)
+            ? "estimating…"
+            : `~${formatDuration(p.eta_seconds)}`;
+
+        // The bar follows the work done (pages), not reviews: Nykaa's total includes reviews it
+        // never serves, so a review-based bar would stall short of 100%
+        if (p.pages_estimated > 0) {
+            const pct = Math.min(99, Math.round((p.pages_done / p.pages_estimated) * 100));
             progressBar.className = "progress-bar-fill determinate";
             progressBar.style.width = `${pct}%`;
             loaderTitle.textContent = `Scraping reviews... ${pct}%`;
-            liveTicker.textContent = `Collected ${collected.toLocaleString()} of ${total.toLocaleString()} reviews (${pages} pages fetched)`;
-        } else {
-            liveTicker.textContent = `Collected ${collected.toLocaleString()} reviews (${pages} pages fetched)`;
         }
+        if (p.stage) liveTicker.textContent = p.stage;
     }
 
     function startScrapingUI() {
@@ -246,6 +267,9 @@ document.addEventListener("DOMContentLoaded", () => {
         progressBar.style.width = "";
         loaderTitle.textContent = "Connecting to Nykaa...";
         liveTicker.textContent = "Resolving product and fetching the first page of reviews...";
+        psCollected.textContent = "0";
+        psElapsed.textContent = "0s";
+        psEta.textContent = "estimating…";
         loadingSection.scrollIntoView({ behavior: "smooth" });
     }
 
